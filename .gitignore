@@ -7,4 +7,3 @@ outputs/
 .vscode/
 checkpoints/
 logs/
-models/
