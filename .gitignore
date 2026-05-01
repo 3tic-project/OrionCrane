@@ -1,14 +1,10 @@
 /target
 Cargo.lock
-checkpoints/
-checkpoints
-
 .DS_Store
-vendor/
 *.onnx
 outputs/
-
 *.bin
-# tests/
 .vscode/
-/vendor
+checkpoints/
+logs/
+models/

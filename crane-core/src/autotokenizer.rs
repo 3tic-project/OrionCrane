@@ -1,8 +1,8 @@
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
+use minijinja_contrib::add_to_environment;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokenizers::{EncodeInput, Tokenizer};
-use minijinja_contrib::add_to_environment;
 
 /// Defines the aditional parameters available for the `from_pretrained` function
 #[derive(Debug, Clone)]
@@ -121,7 +121,10 @@ impl AutoTokenizer {
 
         // Fall back to a standalone chat_template.jinja if the field is absent.
         if config.chat_template.is_none() {
-            let jinja_path = file.parent().unwrap_or(std::path::Path::new(".")).join("chat_template.jinja");
+            let jinja_path = file
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join("chat_template.jinja");
             if jinja_path.exists() {
                 config.chat_template = std::fs::read_to_string(&jinja_path).ok();
             }
@@ -189,7 +192,14 @@ fn rewrite_python_str_methods(template: &str) -> String {
     let template = rewrite_split_index(template);
 
     // Step 2: rewrite remaining `.method(` → ` | method(`
-    const METHODS: &[&str] = &["startswith", "endswith", "split", "lstrip", "rstrip", "strip"];
+    const METHODS: &[&str] = &[
+        "startswith",
+        "endswith",
+        "split",
+        "lstrip",
+        "rstrip",
+        "strip",
+    ];
     let mut out = template;
     for method in METHODS {
         let pat = format!(".{}(", method);
@@ -214,7 +224,7 @@ fn rewrite_split_index(template: &str) -> String {
             let args_start = i + 7; // after `.split(`
             if let Some(close) = find_matching_paren(&template[args_start..]) {
                 let after_close = args_start + close + 1; // index after ')'
-                // Check for [0] or [-1]
+                                                          // Check for [0] or [-1]
                 if template[after_close..].starts_with("[0]") {
                     out.push_str(" | ");
                     out.push_str(&template[start..args_start + close + 1]);
@@ -287,13 +297,17 @@ impl AutoTokenizer {
         env.add_filter("lstrip", |s: String, chars: Option<String>| -> String {
             match chars {
                 None => s.trim_start().to_string(),
-                Some(c) => s.trim_start_matches(c.chars().collect::<Vec<_>>().as_slice()).to_string(),
+                Some(c) => s
+                    .trim_start_matches(c.chars().collect::<Vec<_>>().as_slice())
+                    .to_string(),
             }
         });
         env.add_filter("rstrip", |s: String, chars: Option<String>| -> String {
             match chars {
                 None => s.trim_end().to_string(),
-                Some(c) => s.trim_end_matches(c.chars().collect::<Vec<_>>().as_slice()).to_string(),
+                Some(c) => s
+                    .trim_end_matches(c.chars().collect::<Vec<_>>().as_slice())
+                    .to_string(),
             }
         });
         env.add_filter("strip", |s: String, chars: Option<String>| -> String {

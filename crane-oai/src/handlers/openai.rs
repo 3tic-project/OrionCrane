@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::State,
     http::StatusCode,
     response::{
         sse::{KeepAlive, Sse},
@@ -24,7 +24,6 @@ use crate::openai_api::*;
 use crate::{make_error, now_epoch, AppState};
 
 use super::sse;
-use super::vlm;
 
 // ─────────────────────────────────────────────────────────────
 //  Chat Completions
@@ -35,19 +34,13 @@ pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
-    // If VLM model is loaded, delegate to VLM handler.
-    if state.gemma4_vlm_tx.is_some() {
-        return vlm::gemma4_vlm_chat_completions(state, req).await;
-    }
-    if state.vlm_tx.is_some() {
-        return vlm::vlm_chat_completions(state, req).await;
-    }
-
     // Apply chat template.
-    let formatted = state
-        .chat_template
-        .apply(&req.messages)
-        .map_err(|e| make_error(StatusCode::BAD_REQUEST, &format!("Chat template failed: {e}")))?;
+    let formatted = state.chat_template.apply(&req.messages).map_err(|e| {
+        make_error(
+            StatusCode::BAD_REQUEST,
+            &format!("Chat template failed: {e}"),
+        )
+    })?;
 
     // Tokenize.
     let input_ids = state
@@ -63,11 +56,8 @@ pub async fn chat_completions(
         .as_ref()
         .map_or(false, |so| so.include_usage);
 
-    let engine = state.engine.as_ref().ok_or_else(|| {
-        make_error(StatusCode::SERVICE_UNAVAILABLE, "Text engine not available (VLM model loaded)")
-    })?;
-
-    let response_rx = engine
+    let response_rx = state
+        .engine
         .submit(
             request_id.clone(),
             input_ids,
@@ -82,8 +72,7 @@ pub async fn chat_completions(
 
     if req.stream {
         let model_name = state.model_name.clone();
-        let stream =
-            sse::make_chat_sse_stream(request_id, model_name, response_rx, include_usage);
+        let stream = sse::make_chat_sse_stream(request_id, model_name, response_rx, include_usage);
         Ok(Sse::new(stream)
             .keep_alive(KeepAlive::default())
             .into_response())
@@ -138,11 +127,8 @@ pub async fn completions(
 
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
 
-    let engine = state.engine.as_ref().ok_or_else(|| {
-        make_error(StatusCode::SERVICE_UNAVAILABLE, "Text engine not available (VLM model loaded)")
-    })?;
-
-    let response_rx = engine
+    let response_rx = state
+        .engine
         .submit(
             request_id.clone(),
             input_ids,
@@ -208,7 +194,10 @@ pub async fn retrieve_model(
     } else {
         Err(make_error(
             StatusCode::NOT_FOUND,
-            &format!("Model '{model_id}' not found. Available: {}", state.model_name),
+            &format!(
+                "Model '{model_id}' not found. Available: {}",
+                state.model_name
+            ),
         ))
     }
 }
@@ -236,10 +225,12 @@ pub async fn tokenize(
     // Determine the text to tokenize.
     let text = if let Some(messages) = &req.messages {
         // Apply chat template first.
-        state
-            .chat_template
-            .apply(messages)
-            .map_err(|e| make_error(StatusCode::BAD_REQUEST, &format!("Chat template failed: {e}")))?
+        state.chat_template.apply(messages).map_err(|e| {
+            make_error(
+                StatusCode::BAD_REQUEST,
+                &format!("Chat template failed: {e}"),
+            )
+        })?
     } else if let Some(text) = &req.text {
         text.clone()
     } else {

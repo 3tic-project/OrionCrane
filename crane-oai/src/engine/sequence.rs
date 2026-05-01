@@ -1,6 +1,9 @@
 use candle_core::Tensor;
 use candle_transformers::generation::LogitsProcessor;
+use std::time::Instant;
 use tokio::sync::mpsc;
+
+use super::paged_kv::PagedKvSequence;
 
 /// Compute the total GPU memory (in bytes) held by a set of KV caches.
 pub fn kv_cache_bytes(caches: &[Option<(Tensor, Tensor)>]) -> u64 {
@@ -33,6 +36,7 @@ pub struct Sequence {
     // ── identity ──
     pub id: String,
     pub status: SequenceStatus,
+    pub created_at: Instant,
 
     // ── token state ──
     /// Full token list: prompt ++ generated.
@@ -44,9 +48,12 @@ pub struct Sequence {
     /// Saved KV caches when this sequence is not the one loaded in the model.
     /// Each element is `(K, V)` for a layer, or `None` for fresh layers.
     pub kv_caches: Vec<Option<(Tensor, Tensor)>>,
+    /// Logical page table for the Qwen3 paged-KV migration path.
+    pub paged_kv: PagedKvSequence,
 
     // ── sampling ──
     pub logits_processor: LogitsProcessor,
+    pub sampling_seed: u64,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub top_k: Option<usize>,
@@ -135,10 +142,13 @@ mod tests {
         Sequence {
             id: "test-seq".into(),
             status,
+            created_at: Instant::now(),
             tokens,
             prompt_len: prompt.len(),
             kv_caches: vec![],
+            paged_kv: PagedKvSequence::default(),
             logits_processor: LogitsProcessor::new(42, Some(0.8), Some(0.95)),
+            sampling_seed: 42,
             temperature: Some(0.8),
             top_p: Some(0.95),
             top_k: Some(40),

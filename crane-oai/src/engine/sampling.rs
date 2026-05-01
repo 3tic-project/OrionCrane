@@ -16,6 +16,58 @@ use tracing::debug;
 
 use super::sequence::Sequence;
 
+/// Fast-path predicate for deterministic greedy sampling with no history penalty.
+pub fn is_greedy(seq: &Sequence) -> bool {
+    matches!(seq.temperature, Some(t) if t <= 0.0)
+}
+
+#[cfg(feature = "cuda")]
+fn env_flag_default(name: &str, default: bool) -> bool {
+    match std::env::var(name).ok().as_deref() {
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON") => true,
+        Some("0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF") => false,
+        Some(_) => default,
+        None => default,
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub fn is_greedy_no_penalty(seq: &Sequence) -> bool {
+    is_greedy(seq) && seq.repetition_penalty == 1.0
+}
+
+#[cfg(feature = "cuda")]
+const MAX_FUSED_REPEAT_LAST_N: usize = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum BatchGreedyMode {
+    CudaBf16NoPenalty,
+    CudaBf16Penalty,
+    TensorFallback,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchGreedySample {
+    pub tokens: Vec<u32>,
+    pub mode: BatchGreedyMode,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum BatchNonGreedyMode {
+    CudaBf16TopKTopP,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+pub struct BatchNonGreedySample {
+    pub tokens: Vec<u32>,
+    pub mode: BatchNonGreedyMode,
+    pub active_rows: usize,
+}
+
 /// Persistent buffers for GPU-side top-k/top-p sampling.
 ///
 /// Reuses GPU allocations across steps to avoid repeated mallocs.
@@ -24,6 +76,24 @@ pub struct SamplingBuffers {
     pub topk_shift_bufs: HashMap<usize, Tensor>,
     pub topk_shift_idxs: HashMap<usize, Tensor>,
     pub topk_neg_vecs: HashMap<usize, Tensor>,
+    #[cfg(feature = "cuda")]
+    pub batch_recent_token_ids: Vec<u32>,
+    #[cfg(feature = "cuda")]
+    pub batch_recent_lengths: Vec<u32>,
+    #[cfg(feature = "cuda")]
+    pub batch_penalties: Vec<f32>,
+    #[cfg(feature = "cuda")]
+    pub batch_temperatures: Vec<f32>,
+    #[cfg(feature = "cuda")]
+    pub batch_top_ks: Vec<u32>,
+    #[cfg(feature = "cuda")]
+    pub batch_top_ps: Vec<f32>,
+    #[cfg(feature = "cuda")]
+    pub batch_sampling_seeds: Vec<u64>,
+    #[cfg(feature = "cuda")]
+    pub batch_greedy_cuda_buffers: crane_core::fused_ops::BatchGreedyCudaBuffers,
+    #[cfg(feature = "cuda")]
+    pub batch_non_greedy_cuda_buffers: crane_core::fused_ops::BatchNonGreedyCudaBuffers,
 }
 
 impl SamplingBuffers {
@@ -33,14 +103,28 @@ impl SamplingBuffers {
             topk_shift_bufs: HashMap::new(),
             topk_shift_idxs: HashMap::new(),
             topk_neg_vecs: HashMap::new(),
+            #[cfg(feature = "cuda")]
+            batch_recent_token_ids: Vec::new(),
+            #[cfg(feature = "cuda")]
+            batch_recent_lengths: Vec::new(),
+            #[cfg(feature = "cuda")]
+            batch_penalties: Vec::new(),
+            #[cfg(feature = "cuda")]
+            batch_temperatures: Vec::new(),
+            #[cfg(feature = "cuda")]
+            batch_top_ks: Vec::new(),
+            #[cfg(feature = "cuda")]
+            batch_top_ps: Vec::new(),
+            #[cfg(feature = "cuda")]
+            batch_sampling_seeds: Vec::new(),
+            #[cfg(feature = "cuda")]
+            batch_greedy_cuda_buffers: crane_core::fused_ops::BatchGreedyCudaBuffers::new(),
+            #[cfg(feature = "cuda")]
+            batch_non_greedy_cuda_buffers: crane_core::fused_ops::BatchNonGreedyCudaBuffers::new(),
         }
     }
 
-    pub fn get_topk_neg_vec(
-        &mut self,
-        k: usize,
-        device: &Device,
-    ) -> candle_core::Result<Tensor> {
+    pub fn get_topk_neg_vec(&mut self, k: usize, device: &Device) -> candle_core::Result<Tensor> {
         if let Some(t) = self.topk_neg_vecs.get(&k) {
             if t.device().same_device(device) {
                 return Ok(t.clone());
@@ -51,11 +135,7 @@ impl SamplingBuffers {
         Ok(t)
     }
 
-    pub fn get_topk_shift_idx(
-        &mut self,
-        k: usize,
-        device: &Device,
-    ) -> candle_core::Result<Tensor> {
+    pub fn get_topk_shift_idx(&mut self, k: usize, device: &Device) -> candle_core::Result<Tensor> {
         if let Some(t) = self.topk_shift_idxs.get(&k) {
             if t.device().same_device(device) {
                 return Ok(t.clone());
@@ -107,6 +187,253 @@ impl SamplingBuffers {
     }
 }
 
+#[cfg(feature = "cuda")]
+fn derive_row_seed(seq: &Sequence, row: usize) -> u64 {
+    let mut hash = seq.sampling_seed ^ 0x9e37_79b9_7f4a_7c15u64;
+    for byte in seq.id.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash ^= (seq.tokens.len() as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    hash ^= (seq.num_generated() as u64).wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^= (row as u64).wrapping_mul(0xd6e8_feb8_6659_fd93);
+    hash
+}
+
+#[cfg(feature = "cuda")]
+pub fn sample_batch_non_greedy_cuda(
+    logits: &Tensor,
+    seqs: &[&Sequence],
+    alive: &[bool],
+    buffers: &mut SamplingBuffers,
+) -> Result<Option<BatchNonGreedySample>> {
+    if seqs.len() != alive.len() {
+        anyhow::bail!("sample_batch_non_greedy_cuda: seq/alive length mismatch")
+    }
+    if !logits.device().is_cuda() || logits.dtype() != DType::BF16 {
+        return Ok(None);
+    }
+    if !env_flag_default("CRANE_BATCH_NON_GREEDY_SAMPLING", true) {
+        return Ok(None);
+    }
+    let active_rows = alive.iter().filter(|&&is_alive| is_alive).count();
+    if active_rows == 0 {
+        return Ok(None);
+    }
+
+    let mut max_recent = 0usize;
+    buffers.batch_temperatures.resize(seqs.len(), 0.0);
+    buffers.batch_top_ks.resize(seqs.len(), 0);
+    buffers.batch_top_ps.resize(seqs.len(), 1.0);
+    buffers.batch_sampling_seeds.resize(seqs.len(), 0);
+    buffers.batch_penalties.resize(seqs.len(), 1.0);
+    buffers.batch_recent_lengths.resize(seqs.len(), 0);
+    buffers.batch_penalties.fill(1.0);
+    buffers.batch_recent_lengths.fill(0);
+
+    for (row, (seq, &is_alive)) in seqs.iter().zip(alive.iter()).enumerate() {
+        if !is_alive {
+            continue;
+        }
+
+        let temperature = seq.temperature.unwrap_or(1.0);
+        if temperature <= 0.0 {
+            buffers.batch_temperatures[row] = 0.0;
+            buffers.batch_top_ks[row] = 1;
+            buffers.batch_top_ps[row] = 1.0;
+        } else {
+            let Some(top_k) = seq.top_k else {
+                return Ok(None);
+            };
+            if top_k == 0 || top_k > 64 {
+                return Ok(None);
+            }
+            let top_p = seq.top_p.unwrap_or(1.0);
+            if !(0.0..=1.0).contains(&top_p) || top_p == 0.0 {
+                return Ok(None);
+            }
+            buffers.batch_temperatures[row] = temperature as f32;
+            buffers.batch_top_ks[row] = top_k as u32;
+            buffers.batch_top_ps[row] = top_p as f32;
+        }
+        buffers.batch_sampling_seeds[row] = derive_row_seed(seq, row);
+        buffers.batch_penalties[row] = seq.repetition_penalty;
+
+        if seq.repetition_penalty != 1.0 {
+            let recent_len = seq.tokens.len().min(seq.repeat_last_n);
+            if recent_len > MAX_FUSED_REPEAT_LAST_N {
+                return Ok(None);
+            }
+            max_recent = max_recent.max(recent_len);
+        }
+    }
+
+    if max_recent > 0 {
+        buffers
+            .batch_recent_token_ids
+            .resize(seqs.len() * max_recent, 0);
+        buffers.batch_recent_token_ids.fill(0);
+        for (row, (seq, &is_alive)) in seqs.iter().zip(alive.iter()).enumerate() {
+            if !is_alive || seq.repetition_penalty == 1.0 {
+                continue;
+            }
+            let recent_len = seq.tokens.len().min(seq.repeat_last_n).min(max_recent);
+            let start = seq.tokens.len().saturating_sub(recent_len);
+            buffers.batch_recent_lengths[row] = recent_len as u32;
+            buffers.batch_recent_token_ids[row * max_recent..row * max_recent + recent_len]
+                .copy_from_slice(&seq.tokens[start..]);
+        }
+    } else {
+        buffers.batch_recent_token_ids.clear();
+    }
+
+    let tokens = crane_core::fused_ops::gpu_sample_topk_topp_batch_bf16_cached(
+        logits,
+        &buffers.batch_temperatures,
+        &buffers.batch_top_ks,
+        &buffers.batch_top_ps,
+        &buffers.batch_sampling_seeds,
+        &buffers.batch_recent_token_ids,
+        &buffers.batch_recent_lengths,
+        &buffers.batch_penalties,
+        max_recent,
+        &mut buffers.batch_non_greedy_cuda_buffers,
+    )
+    .map_err(anyhow::Error::from)?;
+
+    Ok(Some(BatchNonGreedySample {
+        tokens,
+        mode: BatchNonGreedyMode::CudaBf16TopKTopP,
+        active_rows,
+    }))
+}
+
+/// Batch deterministic sampling for active greedy rows.
+///
+/// The no-penalty BF16 CUDA case uses Crane's custom batch argmax. If any
+/// active row needs repetition penalty, this mirrors the existing row path by
+/// converting logits to F32, applying per-row penalties, then doing one batched
+/// argmax and one compact DtoH copy.
+pub fn sample_batch_greedy(
+    logits: &Tensor,
+    seqs: &[&Sequence],
+    alive: &[bool],
+    buffers: &mut SamplingBuffers,
+) -> Result<BatchGreedySample> {
+    #[cfg(not(feature = "cuda"))]
+    let _ = buffers;
+
+    if seqs.len() != alive.len() {
+        anyhow::bail!("sample_batch_greedy: seq/alive length mismatch")
+    }
+    if seqs
+        .iter()
+        .zip(alive.iter())
+        .any(|(seq, &is_alive)| is_alive && !is_greedy(seq))
+    {
+        anyhow::bail!("sample_batch_greedy called with non-greedy active row")
+    }
+
+    #[cfg(feature = "cuda")]
+    {
+        let all_active_no_penalty = seqs
+            .iter()
+            .zip(alive.iter())
+            .all(|(seq, &is_alive)| !is_alive || is_greedy_no_penalty(seq));
+        if all_active_no_penalty && logits.device().is_cuda() && logits.dtype() == DType::BF16 {
+            let tokens = crane_core::fused_ops::gpu_argmax_batch_cached(
+                logits,
+                &mut buffers.batch_greedy_cuda_buffers,
+            )
+            .map_err(anyhow::Error::from)?;
+            return Ok(BatchGreedySample {
+                tokens,
+                mode: BatchGreedyMode::CudaBf16NoPenalty,
+            });
+        }
+
+        if logits.device().is_cuda() && logits.dtype() == DType::BF16 {
+            let max_recent = seqs
+                .iter()
+                .zip(alive.iter())
+                .filter_map(|(seq, &is_alive)| {
+                    if is_alive && seq.repetition_penalty != 1.0 {
+                        Some(seq.tokens.len().min(seq.repeat_last_n))
+                    } else {
+                        None
+                    }
+                })
+                .max()
+                .unwrap_or(0);
+
+            if max_recent > 0 && max_recent <= MAX_FUSED_REPEAT_LAST_N {
+                buffers
+                    .batch_recent_token_ids
+                    .resize(seqs.len() * max_recent, 0);
+                buffers.batch_recent_token_ids.fill(0);
+                buffers.batch_recent_lengths.resize(seqs.len(), 0);
+                buffers.batch_recent_lengths.fill(0);
+                buffers.batch_penalties.resize(seqs.len(), 1.0);
+                buffers.batch_penalties.fill(1.0);
+
+                for (row, (seq, &is_alive)) in seqs.iter().zip(alive.iter()).enumerate() {
+                    if !is_alive || seq.repetition_penalty == 1.0 {
+                        continue;
+                    }
+                    let recent_len = seq.tokens.len().min(seq.repeat_last_n).min(max_recent);
+                    let start = seq.tokens.len().saturating_sub(recent_len);
+                    buffers.batch_recent_lengths[row] = recent_len as u32;
+                    buffers.batch_penalties[row] = seq.repetition_penalty;
+                    buffers.batch_recent_token_ids[row * max_recent..row * max_recent + recent_len]
+                        .copy_from_slice(&seq.tokens[start..]);
+                }
+
+                match crane_core::fused_ops::gpu_argmax_batch_with_repetition_penalty_cached(
+                    logits,
+                    &buffers.batch_recent_token_ids,
+                    &buffers.batch_recent_lengths,
+                    &buffers.batch_penalties,
+                    max_recent,
+                    &mut buffers.batch_greedy_cuda_buffers,
+                ) {
+                    Ok(tokens) => {
+                        return Ok(BatchGreedySample {
+                            tokens,
+                            mode: BatchGreedyMode::CudaBf16Penalty,
+                        });
+                    }
+                    Err(err) => {
+                        debug!("BF16 penalty batch argmax unavailable: {err}; falling back");
+                    }
+                }
+            }
+        }
+    }
+
+    let logits = if logits.rank() == 3 {
+        logits.squeeze(1)?
+    } else {
+        logits.clone()
+    }
+    .to_dtype(DType::F32)?;
+
+    for (row, (seq, &is_alive)) in seqs.iter().zip(alive.iter()).enumerate() {
+        if !is_alive || seq.repetition_penalty == 1.0 {
+            continue;
+        }
+        let start_at = seq.tokens.len().saturating_sub(seq.repeat_last_n);
+        let row_logits = logits.narrow(0, row, 1)?.squeeze(0)?;
+        apply_repeat_penalty_inplace(&row_logits, seq.repetition_penalty, &seq.tokens[start_at..])
+            .map_err(anyhow::Error::from)?;
+    }
+
+    let tokens = logits.argmax(candle_core::D::Minus1)?;
+    Ok(BatchGreedySample {
+        tokens: tokens.to_vec1::<u32>()?,
+        mode: BatchGreedyMode::TensorFallback,
+    })
+}
+
 /// Sample a token from logits for a specific sequence.
 ///
 /// Supports:
@@ -126,13 +453,9 @@ pub fn sample(
     // ── Fast path: greedy + no repetition penalty ──────────────────────
     // Skip the bf16→f32 conversion and use GPU argmax directly on bf16
     // logits.  Saves one dtype-conversion kernel + less DtoH.
-    let greedy = match seq.temperature {
-        Some(t) => t <= 0.0,
-        None => false,
-    };
     #[cfg(feature = "cuda")]
     {
-        if greedy && seq.repetition_penalty == 1.0 && logits.device().is_cuda() {
+        if is_greedy_no_penalty(seq) && logits.device().is_cuda() {
             let flat = logits.squeeze(0)?.squeeze(0)?;
             let token = crane_core::fused_ops::gpu_argmax(&flat)?;
             if trace {
@@ -148,7 +471,37 @@ pub fn sample(
     }
 
     let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+    sample_from_f32_logits(seq_id, seq, &logits, buffers, trace, t0)
+}
+
+/// Prepare batched logits once for row-wise sampling fallback.
+pub fn prepare_batch_sampling_logits(logits: &Tensor) -> Result<Tensor> {
+    let logits = if logits.rank() == 3 {
+        logits.squeeze(1)?
+    } else {
+        logits.clone()
+    };
+    Ok(logits.to_dtype(DType::F32)?)
+}
+
+/// Sample from a single row of already-prepared F32 logits.
+pub fn sample_from_f32_logits(
+    seq_id: &str,
+    seq: &mut Sequence,
+    logits: &Tensor,
+    buffers: &mut SamplingBuffers,
+    trace: bool,
+    t0: Instant,
+) -> Result<u32> {
+    if logits.rank() != 1 || logits.dtype() != DType::F32 {
+        anyhow::bail!(
+            "sample_from_f32_logits expects a 1D F32 tensor, got rank={} dtype={:?}",
+            logits.rank(),
+            logits.dtype()
+        );
+    }
     let t_after_prep = Instant::now();
+    let greedy = is_greedy(seq);
 
     if seq.repetition_penalty != 1.0 {
         let start_at = seq.tokens.len().saturating_sub(seq.repeat_last_n);
@@ -174,12 +527,7 @@ pub fn sample(
             // Fall back to CPU LogitsProcessor which handles temperature +
             // top-p natively and only needs a ~600 KB DtoH copy.
             // Set CRANE_FORCE_GPU_TOPK=1 to override this heuristic.
-            if vocab > 65536
-                && std::env::var("CRANE_FORCE_GPU_TOPK")
-                    .ok()
-                    .as_deref()
-                    != Some("1")
-            {
+            if vocab > 65536 && std::env::var("CRANE_FORCE_GPU_TOPK").ok().as_deref() != Some("1") {
                 let next_token = seq.logits_processor.sample(&logits)?;
                 if trace {
                     let t_done = Instant::now();
@@ -202,7 +550,8 @@ pub fn sample(
         top_k = top_k.min(64).min(vocab);
 
         if top_k > 0 && top_k < vocab {
-            let topk_idx = crane_core::fused_ops::topk_indices(&logits, top_k).map_err(anyhow::Error::from)?;
+            let topk_idx =
+                crane_core::fused_ops::topk_indices(&logits, top_k).map_err(anyhow::Error::from)?;
             let topk_logits = logits.gather(&topk_idx, candle_core::D::Minus1)?;
             let t_after_topk = Instant::now();
 
@@ -244,8 +593,7 @@ pub fn sample(
                     .reshape(top_k)?;
                 let mask_le = cumsum.le(top_p)?;
 
-                let shift =
-                    buffers.get_topk_shift_buf(top_k, logits.device(), mask_le.dtype())?;
+                let shift = buffers.get_topk_shift_buf(top_k, logits.device(), mask_le.dtype())?;
                 shift.zero_set()?;
                 if top_k > 1 {
                     let idx = buffers.get_topk_shift_idx(top_k, logits.device())?;
@@ -338,6 +686,33 @@ pub fn rand_seed() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::sequence::SequenceStatus;
+    use candle_transformers::generation::LogitsProcessor;
+    use std::time::Instant;
+    use tokio::sync::mpsc;
+
+    fn make_greedy_seq(tokens: Vec<u32>, repetition_penalty: f32) -> Sequence {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        Sequence {
+            id: "test-seq".into(),
+            status: SequenceStatus::Running,
+            created_at: Instant::now(),
+            prompt_len: tokens.len(),
+            tokens,
+            kv_caches: vec![],
+            paged_kv: crate::engine::paged_kv::PagedKvSequence::default(),
+            logits_processor: LogitsProcessor::new(42, Some(0.0), Some(1.0)),
+            sampling_seed: 42,
+            temperature: Some(0.0),
+            top_p: Some(1.0),
+            top_k: None,
+            max_tokens: 16,
+            eos_token_id: vec![0],
+            repetition_penalty,
+            repeat_last_n: 64,
+            response_tx: tx,
+        }
+    }
 
     #[test]
     fn rand_seed_is_nonzero() {
@@ -363,6 +738,16 @@ mod tests {
         assert!(b.topk_shift_bufs.is_empty());
         assert!(b.topk_shift_idxs.is_empty());
         assert!(b.topk_neg_vecs.is_empty());
+        #[cfg(feature = "cuda")]
+        {
+            assert!(b.batch_recent_token_ids.is_empty());
+            assert!(b.batch_recent_lengths.is_empty());
+            assert!(b.batch_penalties.is_empty());
+            assert!(b.batch_temperatures.is_empty());
+            assert!(b.batch_top_ks.is_empty());
+            assert!(b.batch_top_ps.is_empty());
+            assert!(b.batch_sampling_seeds.is_empty());
+        }
     }
 
     #[test]
@@ -438,6 +823,36 @@ mod tests {
 
         let mat2 = b.get_topk_cumsum_mat(4, &dev).unwrap();
         assert_eq!(mat2.dims(), &[4, 4]);
+    }
+
+    #[test]
+    fn sample_batch_greedy_matches_row_argmax_without_penalty() {
+        let logits =
+            Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 5.0, 6.0, 4.0], (2, 3), &Device::Cpu).unwrap();
+        let seq0 = make_greedy_seq(vec![0], 1.0);
+        let seq1 = make_greedy_seq(vec![1], 1.0);
+        let mut buffers = SamplingBuffers::new();
+
+        let sample =
+            sample_batch_greedy(&logits, &[&seq0, &seq1], &[true, true], &mut buffers).unwrap();
+
+        assert_eq!(sample.tokens, vec![2, 1]);
+        assert_eq!(sample.mode, BatchGreedyMode::TensorFallback);
+    }
+
+    #[test]
+    fn sample_batch_greedy_applies_repetition_penalty() {
+        let logits =
+            Tensor::from_vec(vec![5.0f32, 4.0, 1.0, 0.5, 1.0, 2.0], (2, 3), &Device::Cpu).unwrap();
+        let seq0 = make_greedy_seq(vec![0], 2.0);
+        let seq1 = make_greedy_seq(vec![1], 1.0);
+        let mut buffers = SamplingBuffers::new();
+
+        let sample =
+            sample_batch_greedy(&logits, &[&seq0, &seq1], &[true, true], &mut buffers).unwrap();
+
+        assert_eq!(sample.tokens, vec![1, 2]);
+        assert_eq!(sample.mode, BatchGreedyMode::TensorFallback);
     }
 
     // ── apply_repeat_penalty_inplace tests ──

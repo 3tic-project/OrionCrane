@@ -1,833 +1,178 @@
 # crane-oai
 
-An OpenAI & SGLang compatible inference API server built on the [Crane](../README.md) framework, with continuous batching support.
+`crane-oai` is a Qwen3-only API server. It exposes OpenAI-compatible and SGLang-compatible text generation endpoints backed by the Qwen3 inference path in `crane-core`.
 
-## Features
-
-- **OpenAI-compatible API** — Chat Completions, Text Completions, Text-to-Speech, Models, Tokenize/Detokenize
-- **SGLang native API** — `/generate`, `/model_info`, `/server_info` and related endpoints
-- **Continuous batching** — Dedicated inference thread with prefill-priority scheduling, dynamic KV memory budget, and automatic sequence eviction/recovery
-- **Multi-model support** — Auto-detects and loads Hunyuan Dense, Qwen 2.5, Qwen 3, Qwen3-TTS architectures
-- **Qwen3-TTS** — Full two-level TTS inference (Talker + Code Predictor) with native Candle speech-tokenizer decoder (ONNX optional fallback); exposes OpenAI-compatible `/v1/audio/speech`
-- **Streaming** — SSE (Server-Sent Events) token streaming
-- **Cross-platform acceleration** — CPU / CUDA / Apple Metal, selected automatically
-
-## Quick Start
-
-### Build
+## Build
 
 ```bash
-# CPU only
 cargo build -p crane-oai --release
-
-# CUDA (NVIDIA GPU)
 cargo build -p crane-oai --release --features cuda
 ```
 
-### Run
-
-```bash
-# Auto-detect model type and device
-crane-oai --model-path /path/to/model
-
-# Specify model type and port
-crane-oai --model-path /path/to/Qwen2.5-7B-Instruct \
-    --model-type qwen25 \
-    --port 8000
-
-# GGUF weights
-crane-oai --model-path /path/to/model.gguf \
-    --format gguf
-
-# Force CPU
-crane-oai --model-path /path/to/model --cpu
-```
-
-### Qwen3-TTS Quick Start
-
-> Native speech-tokenizer decoding is enabled by default. ONNX export is optional as a compatibility fallback.
-
-**Step 1 — Download the model**
-
-```bash
-mkdir -p checkpoints/
-# Base model (multi-speaker, 12 Hz)
-huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-Base \
-    --local-dir checkpoints/Qwen3-TTS-12Hz-0.6B-Base
-
-# Custom-voice model (add your own speaker embedding)
-huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
-    --local-dir checkpoints/Qwen3-TTS-12Hz-0.6B-CustomVoice
-```
-
-**Step 2 — (Optional) Export the ONNX speech-tokenizer decoder fallback**
-
-```bash
-# Install the Qwen3-TTS Python package first (needed for export only)
-pip install -e vendor/Qwen3-TTS
-
-python scripts/export_qwen_tts_tokenizer_onnx.py \
-    checkpoints/Qwen3-TTS-12Hz-0.6B-Base/speech_tokenizer \
-    checkpoints/Qwen3-TTS-12Hz-0.6B-Base/speech_tokenizer/speech_tokenizer_decoder.onnx
-```
-
-**Step 3 — Build and start the server**
-
-```bash
-# CPU (always available)
-cargo build -p crane-oai --release
-
-# CUDA
-cargo build -p crane-oai --release --features "cuda"
-
-# macOS Metal (auto-enabled by target)
-cargo build -p crane-oai --release
-
-# Start the TTS server (auto-detected from config.json)
-./target/release/crane-oai \
-    --model-path checkpoints/Qwen3-TTS-12Hz-0.6B-Base \
-    --model-type qwen3_tts \
-    --port 8080
-```
-
-**Step 4 — Synthesize speech**
-
-```bash
-# Generate WAV audio from text (CustomVoice model — predefined speakers)
-curl http://localhost:8080/v1/audio/speech \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen3-TTS",
-    "input": "今天天气真好，我们去公园吧！",
-    "voice": "Serena",
-    "language": "chinese"
-  }' \
-  --output speech.wav
-
-# English
-curl http://localhost:8080/v1/audio/speech \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen3-TTS",
-    "input": "Hello, this is a test of the Qwen3-TTS model.",
-    "voice": "Ryan",
-    "language": "english"
-  }' \
-  --output speech.wav
-
-# Voice cloning (Base model — reference audio + transcript)
-curl http://localhost:8080/v1/audio/speech \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen3-TTS",
-    "input": "そんな何もない今日が 少しだけでもいい日になったと思えたら",
-    "language": "japanese",
-    "reference_audio": "/path/to/reference.wav",
-    "reference_text": "Reference audio transcript goes here"
-  }' \
-  --output voice_clone.wav
-```
-
-## Qwen3-TTS
-
-Crane implements a full **Qwen3-TTS** inference pipeline in pure Rust + Candle, making it the first non-Python framework to support this model.
-
-### Architecture overview
-
-```
-Text input
-  │
-  ▼
-Tokenizer (Qwen chat tokenizer: tokenizer.json OR vocab.json + merges.txt)
-  │
-  ▼
-┌──────────────────────────────────────────────────┐
-│  Talker  (28-layer transformer, MRoPE)           │
-│  - Embeds text via text_projection MLP           │
-│  - Autoregressively generates codec group 0      │
-└──────────────────────────────────────────────────┘
-  │  hidden state + group-0 token
-  ▼
-┌──────────────────────────────────────────────────┐
-│  Code Predictor  (5-layer transformer)           │
-│  - Predicts codec groups 1–15 from hidden state  │
-└──────────────────────────────────────────────────┘
-  │  [T, 16] codec tokens
-  ▼
-┌──────────────────────────────────────────────────┐
-│  Speech Tokenizer Decoder  (native Candle)       │
-│  - 12 Hz, 24 kHz, 16 RVQ quantizers             │
-│  - Converts [1, 16, T] tokens → [1, 1, S] audio │
-└──────────────────────────────────────────────────┘
-  │
-  ▼
-WAV audio (24 kHz, 16-bit PCM)
-```
-
-### Setup
-
-**1. (Optional) Export the speech tokenizer ONNX fallback** (one-time step):
-
-```bash
-# Install required Python package (for export only — not needed at runtime)
-pip install -e vendor/Qwen3-TTS
-
-# Base model
-python scripts/export_qwen_tts_tokenizer_onnx.py \
-    checkpoints/Qwen3-TTS-12Hz-0.6B-Base/speech_tokenizer \
-    checkpoints/Qwen3-TTS-12Hz-0.6B-Base/speech_tokenizer/speech_tokenizer_decoder.onnx
-
-# CustomVoice model
-python scripts/export_qwen_tts_tokenizer_onnx.py \
-    checkpoints/Qwen3-TTS-12Hz-0.6B-CustomVoice/speech_tokenizer \
-    checkpoints/Qwen3-TTS-12Hz-0.6B-CustomVoice/speech_tokenizer/speech_tokenizer_decoder.onnx
-```
-
-**2. Build:**
-
-```bash
-# CPU
-cargo build -p crane-oai --release
-
-# CUDA
-cargo build -p crane-oai --release --features "cuda"
-
-# macOS Metal (auto-enabled by target)
-cargo build -p crane-oai --release
-```
-
-**3. Start the server:**
+## Run
 
 ```bash
 ./target/release/crane-oai \
-    --model-path checkpoints/Qwen3-TTS-12Hz-0.6B-Base \
-    --model-type qwen3_tts \
-    --port 8080
+  --model-path /path/to/Qwen3-1.7B \
+  --model-type qwen3 \
+  --port 8000
 ```
 
-The model type is auto-detected from `config.json` — `--model-type qwen3_tts` is optional if the path contains `Qwen3-TTS`.
+Useful options:
 
-### Model variants
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `--model-path` | required | Qwen3 model directory or GGUF file. |
+| `--model-type` | `auto` | `auto` or `qwen3`; non-Qwen3 models are rejected. |
+| `--format` | `auto` | `auto`, `safetensors`, or `gguf`. |
+| `--cpu` | false | Force CPU execution. |
+| `--max-concurrent` | auto (VRAM-tiered) | Max running decode sequences. See *Adaptive defaults* below. |
+| `--decode-tokens-per-seq` | auto (VRAM-tiered) | Decode rounds per sequence before switching. See *Adaptive defaults* below. |
+| `--max-seq-len` | 2800 | Prompt plus completion limit; 0 means unlimited. |
+| `--gpu-memory-limit` | unset (full device VRAM) | Absolute size such as `8G` or fraction such as `0.7`. |
 
-| Variant | HuggingFace ID | Description | Voice selection |
-|---------|---------------|-------------|-----------------|
-| CustomVoice | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` | Predefined speakers | `voice` field (e.g. "Serena") |
-| Base | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | Voice cloning via reference audio | `reference_audio` + `reference_text` |
+### Adaptive defaults
 
-#### Voice cloning (Base model)
+`--max-concurrent` and `--decode-tokens-per-seq` auto-tune based on the
+*effective GPU budget*, resolved in this order:
 
-The Base model supports in-context learning (ICL) voice cloning: given a reference audio clip and its transcript, the model synthesizes new text in the same voice.
+1. If `--gpu-memory-limit` is set, the budget is `min(--gpu-memory-limit,
+   free VRAM)`.
+2. Otherwise the budget is the *available* (free) device VRAM at startup,
+   queried after model load + warmup. This adapts to whatever other processes
+   are already using the card.
+3. On CPU or when CUDA is unavailable, defaults fall back to the middle tier.
+
+| GPU budget | `--max-concurrent` | `--decode-tokens-per-seq` |
+| --- | --- | --- |
+| `< 8G`        | 6  | 16 |
+| `8G .. 18G`   | 16 | 16 |
+| `>= 18G`      | 28 | 32 |
+| unknown / CPU | 16 | 16 |
+
+Pass either flag explicitly to override the auto value. Both the GPU memory
+snapshot and the resolved values are logged at startup:
+
+```
+GPU memory at startup: free=20.0G / total=24.0G
+Adaptive defaults: budget=20.0G (source=free VRAM) max_concurrent=28 ...
+```
+
+### Performance defaults
+
+The shipped defaults are tuned for the typical OpenAI-style translation /
+short-completion workload on Qwen3 1.7B BF16. **You should not need to set
+any environment variables for production deployments** — running
 
 ```bash
-# Voice-clone a Japanese sentence using a reference audio clip
-curl http://localhost:8080/v1/audio/speech \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen3-TTS",
-    "input": "こうして君に直接ありがとうを言える時間をくれたこと それが多分一番私は嬉しい",
-    "language": "japanese",
-    "reference_audio": "data/audio/kinsenka_3.wav",
-    "reference_text": "こうして君に直接ありがとうを言える時間をくれたこと それが多分一番私は嬉しい"
-  }' \
-  --output voice_clone.wav
+./target/release/crane-oai \
+  --model-path /path/to/Qwen3-1.7B \
+  --max-concurrent 32 \
+  --gpu-memory-limit 0.85 \
+  --max-seq-len 2048
 ```
 
-**Voice-clone fields:**
+reproduces the best-known throughput on Qwen3 1.7B (validated 2026-04-30,
+RTX-class GPU, BLOCKS=200, MC=32: **6.19 s / 916 chars·s⁻¹, 100/100 ok**).
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `reference_audio` | string | Local file path to reference WAV audio |
-| `reference_text` | string | Transcript of the reference audio (required) |
+The defaults are pinned to the best-performing values for every tunable that
+materially affects throughput:
 
-> **Note:** When `reference_audio` is set, the model runs in voice-clone mode regardless of the `voice` field. The reference audio must be a WAV file. The `language` field should match the target text language.
+| Setting | Default | Why |
+| --- | --- | --- |
+| `--decode-tokens-per-seq` | **auto: 16 / 16 / 32** | VRAM-tiered (see *Adaptive defaults* above). 16 is best on small/medium GPUs; 32 wins on ≥18G where the larger batch amortises setup cost. |
+| `--max-concurrent` | **auto: 6 / 16 / 28** | VRAM-tiered. Larger budgets fit more concurrent sequences before the KV-cache pressure gate kicks in. |
+| `--max-seq-len` | **2800** | Covers typical OpenAI-style chat / translation contexts (prompt + completion). Set to 0 for unlimited. |
+| `CRANE_PAGED_KV_NATIVE_APPEND` | **on** (CUDA BF16) | Source of the Round 9 win; collapses per-token KV materialisation kernels. |
+| `CRANE_PAGED_KV_GATHER_EXTRACT` | **on** (CUDA BF16) | One-shot gather kernels per layer instead of per-row per-layer. |
+| `CRANE_PAGED_KV_ATTENTION` | **off** | Current paged attention kernel regresses on short/medium contexts; eager GQA wins. |
+| `CRANE_PAGED_KV_BATCHED_SETUP` | **off** | Round 9 fast path is correctness-broken; do not enable. |
+| `CRANE_CUDA_GRAPH_DECODE` | **off** | Eager forward is at parity or ~1% faster on the validated workload. |
+| `CRANE_CUDA_GRAPH_DECODE_CAPTURE` | **off** | Requires the master switch; opt-in only. |
+| `CRANE_CUDA_GRAPH_DECODE_WIDTH_BUCKET` | **on** | Safe with capture off; ~6–10% lift when capture is on. Leave on. |
 
-### Speaker list (Base model)
+Only `--max-concurrent` and `--gpu-memory-limit` are deployment-specific and
+should be tuned to the available VRAM and target concurrency.
 
-The available speakers are defined in `config.json` under `talker_config.spk_id`. Open the file to see all names:
+## Endpoints
 
-```bash
-python3 -c "
-import json, sys
-c = json.load(open('checkpoints/Qwen3-TTS-12Hz-0.6B-Base/config.json'))
-for name in sorted(c['talker_config']['spk_id']):
-    print(name)
-"
-```
+OpenAI-compatible:
 
-Built-in speakers for the CustomVoice model include: `Serena`, `Vivian`, `Uncle_fu`, `Ryan`, `Aiden`, `Ono_anna`, `Sohee`, `Eric`, `Dylan`. Larger model variants may include additional speakers. Check your model's `config.json` for the full list.
+- `POST /v1/chat/completions`
+- `POST /v1/completions`
+- `GET /v1/models`
+- `GET /v1/models/{model_id}`
+- `POST /v1/tokenize`
+- `POST /v1/detokenize`
 
-### Generation parameters
+SGLang-compatible:
 
-| Parameter | Default | Recommended | Notes |
-|-----------|---------|-------------|-------|
-| `temperature` | `0.9` | `0.7`–`0.9` | Lower = more stable prosody; higher = more expressive |
-| `max_tokens` | `8192` | `2048`–`8192` | 12 tokens ≈ 1 second of audio at 12 Hz |
-| `repetition_penalty` | `1.05` | `1.0`–`1.1` | Helps avoid repeating codec tokens |
-| `top_p` | `null` | `null` or `1.0` | Nucleus sampling; `1.0` matches reference defaults |
-| `language` | `auto` | match input | Wrong language hint degrades quality |
+- `POST /generate`
+- `GET /model_info`
+- `GET /server_info`
+- `GET /health_generate`
+- `POST /flush_cache`
+- `POST /abort_request`
 
-### Troubleshooting
-
-**`native speech tokenizer load failed`** — Check `<model_dir>/speech_tokenizer/config.json` and safetensors files are complete. For older checkpoints that miss `quantizer.*._codebook.cluster_usage`, Crane now auto-falls back to a ones vector during load; if loading still fails, optionally export ONNX as a fallback decoder.
-
-**`TTS model not loaded`** — The server was started with an LLM model (not TTS). Restart with `--model-type qwen3_tts`.
-
-**Garbled audio / silence** — Try lowering `temperature` to `0.5`–`0.7` and ensure `language` matches the input text.
-
-**`Speech tokenizer ONNX not found` (fallback path only)** — This appears only when native decoder load fails and ONNX fallback is requested; run export script and place ONNX at `<model_dir>/speech_tokenizer/speech_tokenizer_decoder.onnx`.
-
-## CUDA Usage
-
-> **Note:** CUDA support requires the `cuda` feature flag at build time (see above). The server automatically uses the first available CUDA device.
-
-### Basic CUDA inference
-
-```bash
-crane-oai --model-path /path/to/Qwen3-8B-Instruct
-```
-
-On CUDA, `model_info` will report the device as `Cuda(0)` (or `Cuda(1)`, etc.).
-
-### GPU memory control
-
-GPU memory grows as KV caches accumulate. Use `--gpu-memory-limit` to keep usage bounded:
-
-```bash
-# Hard cap at 8 GB — recommended starting point for a 12 GB GPU
-crane-oai --model-path /path/to/model \
-    --gpu-memory-limit 8G \
-    --max-seq-len 4096
-
-# Cap at 5 GB for 8 GB VRAM cards
-crane-oai --model-path /path/to/model \
-    --gpu-memory-limit 5G \
-    --max-seq-len 2048 \
-    --max-concurrent 4
-
-# Use 75% of total VRAM
-crane-oai --model-path /path/to/model \
-    --gpu-memory-limit 0.75
-```
-
-When the KV memory budget is exceeded, the engine evicts the longest-output sequence (preserving its state), tightens the concurrency cap, and resumes that sequence automatically once load subsides. This avoids OOM without crashing the server.
-
-**Recommended values by GPU size:**
-
-| GPU VRAM | `--gpu-memory-limit` | `--max-seq-len` |
-|----------|---------------------|----------------|
-| 8 GB     | `6G` or `0.7`       | `2048`         |
-| 12 GB    | `8G` or `0.7`       | `4096`         |
-| 24 GB    | `20G` or `0.8`      | `8192`         |
-| 48 GB+   | *(omit)*            | *(omit)*       |
-
-### GGUF quantized models on CUDA
-
-GGUF quantization roughly halves VRAM usage compared to FP16:
-
-```bash
-crane-oai --model-path /path/to/Qwen3-8B-Q4_K_M.gguf \
-    --format gguf \
-    --gpu-memory-limit 8G
-```
-
-### Multi-GPU note
-
-Currently crane-oai runs on a single CUDA device (device 0). Multi-GPU tensor parallelism is not yet supported.
-
-## CLI Parameters
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--model-path` | *(required)* | Path to model directory or GGUF file |
-| `--model-type` | `auto` | Architecture: `auto`, `hunyuan`, `qwen25`, `qwen3`, `qwen3_tts` |
-| `--model-name` | directory name | Model name shown in API responses |
-| `--host` | `0.0.0.0` | Bind address |
-| `--port` | `8080` | Bind port |
-| `--cpu` | `false` | Force CPU even when a GPU is available |
-| `--max-concurrent` | `16` | Hard cap on concurrently decoding sequences. Actual concurrency may be lower when `--gpu-memory-limit` is active. |
-| `--decode-tokens-per-seq` | `16` | Max decode rounds per scheduling step. Higher = less scheduling overhead, higher TTFT for queued requests. |
-| `--format` | `auto` | Weight format: `auto`, `safetensors`, `gguf` |
-| `--max-seq-len` | `0` | Max sequence length (prompt + generation); `0` = unlimited |
-| `--gpu-memory-limit` | *(none)* | VRAM cap: absolute (`5G`, `8G`, `5120M`) or fractional (`0.7` = 70% of total) |
-
-### Parameter tuning guide
-
-| Goal | Recommendation |
-|------|----------------|
-| Constrained VRAM (≤12 GB) | Set `--gpu-memory-limit`; use `--max-concurrent 4–8` as a safety ceiling |
-| Maximum throughput | Increase `--decode-tokens-per-seq` to `32` to reduce scheduling round-trips |
-| Lowest time-to-first-token | Decrease `--decode-tokens-per-seq` to `4–8` so prefill slots in sooner |
-| Long context generation | Set `--max-seq-len` to avoid unbounded KV growth |
-
-## API Reference
-
-### OpenAI-compatible
-
-#### `POST /v1/audio/speech` — Text-to-Speech (Qwen3-TTS)
-
-Synthesizes speech from text. Returns a WAV audio file (or raw PCM, depending on `response_format`).
-
-```bash
-# Basic Chinese TTS (CustomVoice)
-curl http://localhost:8080/v1/audio/speech \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen3-TTS",
-    "input": "今天天气真好，我们去公园吧。",
-    "voice": "Chelsie",
-    "language": "chinese"
-  }' \
-  --output speech.wav
-
-# English TTS with higher temperature
-curl http://localhost:8080/v1/audio/speech \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen3-TTS",
-    "input": "Hello! This is Crane, an ultra-fast inference framework written in Rust.",
-    "voice": "Chelsie",
-    "language": "english",
-    "temperature": 0.8,
-    "max_tokens": 2048
-  }' \
-  --output hello.wav
-
-# Voice cloning (Base model)
-curl http://localhost:8080/v1/audio/speech \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen3-TTS",
-    "input": "そんな何もない今日が 少しだけでもいい日になったと思えたら",
-    "language": "japanese",
-    "reference_audio": "data/audio/kinsenka_3.wav",
-    "reference_text": "こうして君に直接ありがとうを言える時間をくれたこと それが多分一番私は嬉しい"
-  }' \
-  --output voice_clone.wav
-
-# Auto-detect language
-curl http://localhost:8080/v1/audio/speech \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen3-TTS",
-    "input": "This is a bilingual test. 这是一个中英文混合测试。",
-    "language": "auto"
-  }' \
-  --output bilingual.wav
-```
-
-**Request fields:**
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `model` | string | — | Model name (e.g. `"Qwen3-TTS"`) |
-| `input` | string | — | The text to synthesize. UTF-8, up to a few thousand characters |
-| `voice` | string | `null` | Speaker name (CustomVoice model). See speaker list below. `null` uses default voice |
-| `language` | string | `"auto"` | Language hint: `"chinese"`, `"english"`, `"japanese"`, `"korean"`, `"auto"` |
-| `instructions` | string | `null` | Optional system-level prompt to guide speaking style |
-| `response_format` | string | `"wav"` | Output audio format: `"wav"` or `"pcm"` (raw 16-bit LE at 24 kHz). `"mp3"`, `"opus"`, `"aac"`, `"flac"` currently return `400` |
-| `speed` | float | `1.0` | Speaking speed multiplier (reserved, not yet applied to generation) |
-| `temperature` | float | `0.9` | Sampling temperature. Lower = more deterministic |
-| `top_p` | float | `null` | Nucleus sampling threshold (default `null` = no nucleus filtering, equivalent to `1.0`) |
-| `repetition_penalty` | float | `1.05` | Repetition penalty for codec token generation |
-| `max_tokens` | int | `8192` | Max codec tokens to generate. Controls maximum audio duration (~83 ms per token at 12 Hz) |
-| `reference_audio` | string | `null` | Local path to reference WAV audio for voice cloning (Base model only) |
-| `reference_text` | string | `null` | Transcript of the reference audio (required when `reference_audio` is set) |
-
-**Response:** Binary audio bytes with `Content-Type: audio/wav` (`response_format="wav"`) or `audio/pcm` (`response_format="pcm"`). Save WAV as `.wav`, or raw PCM as `.pcm`.
-
-**Approximate duration cap:** `max_tokens / 12` seconds (e.g. `8192` tokens ≈ 683 seconds, `2048` ≈ 171 seconds).
-
-**Available speakers (Qwen3-TTS-12Hz-0.6B-Base):**
-
-| Name | Gender | Language |
-|------|--------|----------|
-| Chelsie | Female | English / Chinese |
-| Ethan | Male | English / Chinese |
-| Cherry | Female | Chinese |
-| Serena | Female | Chinese |
-| ... | — | See `config.json → talker_config.spk_id` for full list |
-
-> **Tip:** The available speaker names are stored in `config.json` under `talker_config.spk_id`. Open the file to see all supported names for your model variant.
-
-#### `POST /v1/chat/completions`
-
-```bash
-# Non-streaming
-curl http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen2.5-7B-Instruct",
-    "messages": [
-      {"role": "system", "content": "You are a helpful assistant."},
-      {"role": "user", "content": "Hello!"}
-    ],
-    "max_tokens": 256,
-    "temperature": 0.7
-  }'
-
-# Streaming (SSE)
-curl http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen2.5-7B-Instruct",
-    "messages": [{"role": "user", "content": "Tell me a joke"}],
-    "stream": true,
-    "stream_options": {"include_usage": true}
-  }'
-```
-
-#### Multimodal / Vision (PaddleOCR-VL-1.5)
-
-For VLM requests, use an array in `content` to provide the image URL and the prompt text:
+## Chat Example
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
+  -H 'Content-Type: application/json' \
   -d '{
-    "model": "paddleocr_vl-1.5",
+    "model": "qwen3",
     "messages": [
-      {
-        "role": "user",
-        "content": [
-          {"type": "image_url", "image_url": {"url": "https://i0.hdslb.com/bfs/new_dyn/1824ac967aca31d7ac9da4fdda678c4639471072.png"}},
-          {"type": "text", "text": "OCR:"}
-        ]
-      }
+      {"role": "user", "content": "Translate to English: 今天天气很好。"}
     ],
-    "max_tokens": 1024
+    "max_tokens": 128,
+    "temperature": 0.0
   }'
 ```
-
-**Request fields:**
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `model` | string | — | Model name |
-| `messages` | array | — | `[{role, content}]`. `content` can be a string, or an array of `{"type": "text", "text": "..."}` and `{"type": "image_url", "image_url": {"url": "..."}}` items for VLM models. |
-| `max_tokens` | int | `512` | Max tokens to generate |
-| `temperature` | float | `0.8` | Sampling temperature; `0` = greedy |
-| `top_p` | float | `0.95` | Nucleus sampling threshold |
-| `top_k` | int | `40` | Top-k sampling |
-| `repetition_penalty` | float | `1.05` | Repetition penalty |
-| `stream` | bool | `false` | Enable SSE streaming |
-| `stream_options` | object | — | `{"include_usage": true}` to include token counts in the final chunk |
-| `seed` | int | — | Random seed for reproducibility |
-
-#### `POST /v1/completions`
-
-Raw text completion (no chat template applied).
-
-```bash
-curl http://localhost:8080/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "Qwen2.5-7B-Instruct", "prompt": "The capital of France is", "max_tokens": 64}'
-```
-
-`prompt` accepts a single string or an array of strings (concatenated).
-
-#### `GET /v1/models` · `GET /v1/models/:model_id`
-
-List available models or fetch metadata for a specific one.
-
-#### `POST /v1/tokenize` · `POST /v1/detokenize`
-
-```bash
-# Text → token IDs
-curl http://localhost:8080/v1/tokenize \
-  -H "Content-Type: application/json" \
-  -d '{"text": "Hello world"}'
-
-# Token IDs → text
-curl http://localhost:8080/v1/detokenize \
-  -H "Content-Type: application/json" \
-  -d '{"tokens": [9707, 1917]}'
-```
-
-### SGLang-compatible
-
-#### `POST /generate`
-
-```bash
-curl http://localhost:8080/generate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "The meaning of life is",
-    "sampling_params": {"max_new_tokens": 128, "temperature": 0.8, "top_p": 0.95}
-  }'
-```
-
-#### Multimodal / Vision (PaddleOCR-VL-1.5)
-
-To run a multimodal inference request with a VLM (PaddleOCR-VL), include the `image_url` parameter:
-
-```bash
-curl http://localhost:8000/generate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "OCR:",
-    "image_url": "https://i0.hdslb.com/bfs/new_dyn/1824ac967aca31d7ac9da4fdda678c4639471072.png",
-    "sampling_params": {"max_new_tokens": 1024}
-  }'
-```
-
-**`sampling_params` fields:**
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `max_new_tokens` | int | `128` | Max tokens to generate |
-| `temperature` | float | `0.8` | Sampling temperature |
-| `top_p` | float | `0.95` | Nucleus sampling |
-| `top_k` | int | `20` | Top-k sampling |
-| `repetition_penalty` | float | `1.0` | Repetition penalty |
-| `stop` | string/array | — | Stop string(s) |
-| `stop_token_ids` | array | — | Stop token IDs |
-| `seed` | int | — | Random seed |
-| `n` | int | `1` | Number of parallel completions |
-
-#### `GET /model_info`
-
-Returns model metadata including device (`Cuda(0)`, `Metal(0)`, `Cpu`).
-
-#### `GET /server_info`
-
-Returns server config and live engine stats.
-
-```json
-{
-  "version": "0.1.0",
-  "model_path": "/models/Qwen2.5-7B-Instruct",
-  "max_concurrent": 16,
-  "decode_tokens_per_seq": 16,
-  "stats": {
-    "total_requests": 42,
-    "completed_requests": 40,
-    "avg_decode_tokens_per_sec": 35.2,
-    "active_sequences": 2,
-    "waiting_sequences": 0
-  }
-}
-```
-
-#### `GET /health_generate`
-
-Deep health check — runs a 1-token inference probe with a 30-second timeout.
-
-#### `POST /abort_request`
-
-Cancel an in-flight request by ID.
-
-```bash
-curl http://localhost:8080/abort_request \
-  -H "Content-Type: application/json" \
-  -d '{"rid": "gen-xxxx-xxxx"}'
-```
-
-### Management
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Liveness check, returns `{"status": "ok"}` |
-| `/v1/stats` | GET | Engine stats snapshot (requests, throughput, active sequences) |
-| `/flush_cache` | POST | KV cache flush (reserved for compatibility; caches are managed automatically) |
-
-## Using with OpenAI SDK
-
-### Chat (LLM)
-
-```python
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://localhost:8080/v1",
-    api_key="not-needed",  # crane-oai does not require an API key
-)
-
-response = client.chat.completions.create(
-    model="Qwen2.5-7B-Instruct",
-    messages=[{"role": "user", "content": "Hello!"}],
-    max_tokens=256,
-)
-print(response.choices[0].message.content)
-
-# Streaming
-stream = client.chat.completions.create(
-    model="Qwen2.5-7B-Instruct",
-    messages=[{"role": "user", "content": "Tell me a story"}],
-    stream=True,
-)
-for chunk in stream:
-    if chunk.choices[0].delta.content:
-        print(chunk.choices[0].delta.content, end="", flush=True)
-```
-
-### Text-to-Speech (Qwen3-TTS)
-
-> Start crane-oai with `--model-type qwen3_tts` and a Qwen3-TTS checkpoint.
-
-**CustomVoice model (predefined speakers):**
-
-```python
-from openai import OpenAI
-import pathlib
-
-client = OpenAI(
-    base_url="http://localhost:8080/v1",
-    api_key="not-needed",
-)
-
-# --- Basic synthesis (returns WAV bytes) ---
-response = client.audio.speech.create(
-    model="Qwen3-TTS",
-    voice="Chelsie",
-    input="今天天气真好，我们去公园吧！",
-    extra_body={"language": "chinese"},
-)
-response.stream_to_file("output.wav")
-
-# --- English ---
-response = client.audio.speech.create(
-    model="Qwen3-TTS",
-    voice="Ethan",
-    input="Hello, this is a test of the Crane TTS engine.",
-    extra_body={"language": "english", "temperature": 0.7},
-)
-response.stream_to_file("english.wav")
-```
-
-**Base model (voice cloning):**
-
-```python
-from openai import OpenAI
-import pathlib
-
-client = OpenAI(
-    base_url="http://localhost:8080/v1",
-    api_key="not-needed",
-)
-
-# --- Voice clone: synthesize new text in the reference speaker's voice ---
-response = client.audio.speech.create(
-    model="Qwen3-TTS",
-    voice="clone",  # voice field is ignored in voice-clone mode
-    input="そんな何もない今日が 少しだけでもいい日になったと思えたら",
-    extra_body={
-        "language": "japanese",
-        "reference_audio": "data/audio/kinsenka_3.wav",
-        "reference_text": "こうして君に直接ありがとうを言える時間をくれたこと それが多分一番私は嬉しい",
-    },
-)
-response.stream_to_file("voice_clone.wav")
-```
-
-**Low-level requests (requests library):**
-
-```python
-import requests, pathlib
-
-# CustomVoice
-r = requests.post(
-    "http://localhost:8080/v1/audio/speech",
-    json={
-        "model": "Qwen3-TTS",
-        "input": "今天天气真好，我们去公园吧！",
-        "voice": "Chelsie",
-        "language": "chinese",
-        "temperature": 0.7,
-        "max_tokens": 2048,
-    },
-)
-r.raise_for_status()
-pathlib.Path("speech.wav").write_bytes(r.content)
-print(f"Saved {len(r.content):,} bytes")
-
-# Voice clone
-r = requests.post(
-    "http://localhost:8080/v1/audio/speech",
-    json={
-        "model": "Qwen3-TTS",
-        "input": "こんにちは、今日はいい天気ですね。",
-        "language": "japanese",
-        "reference_audio": "data/audio/kinsenka_3.wav",
-        "reference_text": "Reference transcript here",
-        "max_tokens": 2048,
-    },
-)
-r.raise_for_status()
-pathlib.Path("voice_clone.wav").write_bytes(r.content)
-```
-
-## Source Structure
-
-```
-crane-oai/src/
-├── main.rs              # CLI entry point, AppState, route registration
-├── openai_api.rs        # OpenAI request/response types (incl. SpeechRequest)
-├── sglang_api.rs        # SGLang native API types
-├── chat_template.rs     # Chat template rendering (Jinja / Hunyuan hard-coded)
-├── handlers/
-│   ├── common.rs        # /health, /v1/stats
-│   ├── openai.rs        # OpenAI endpoint handlers
-│   ├── sglang.rs        # SGLang endpoint handlers
-│   ├── tts.rs           # /v1/audio/speech handler (Qwen3-TTS)
-│   ├── vlm.rs           # VLM handler (PaddleOCR-VL)
-│   └── sse.rs           # SSE stream builder
-└── engine/
-    ├── mod.rs           # InferenceEngine core loop (continuous batching)
-    ├── types.rs         # EngineRequest / EngineResponse / EngineHandle
-    ├── stats.rs         # Lock-free atomic counters
-    ├── sampling.rs      # Token sampling (top-k/p, Gumbel-max, repetition penalty)
-    ├── scheduler.rs     # Prefill-priority scheduler (dynamic effective_max_running cap)
-    ├── sequence.rs      # Sequence lifecycle management
-    ├── backend.rs       # ModelBackend trait and per-model implementations
-    └── model_factory.rs # Model auto-detection and factory (incl. Qwen3TTS)
-```
-
-## Model Backend Support
-
-| Model | Batch decode | KV Swap | Formats | Notes |
-|-------|-------------|---------|---------|-------|
-| Hunyuan Dense | ✅ | ✅ | Safetensors / GGUF | KV pre-alloc, GQA 4D matmul, RoPE cache growth |
-| Qwen 3 | ✅ | ✅ | Safetensors / GGUF | + QK Norm 4D, GGUF quantization |
-| Qwen 2.5 | sequential | ❌ | Safetensors | — |
-| **Qwen3-TTS** | N/A | N/A | Safetensors (ONNX fallback optional) | Dedicated thread; no continuous batching |
-
-Model type is auto-detected from `config.json` (`model_type` / `architectures`) or can be set explicitly with `--model-type`.
-
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CRANE_FORCE_GPU_TOPK` | `0` | Force GPU top-k even for large vocabularies |
-| `CRANE_TOPP_FALLBACK_TOPK` | `64` | k value for GPU top-k fallback |
-| `CRANE_TOPK_SAMPLE_ON_CPU` | `0` | Sample on CPU after GPU top-k |
-| `CRANE_SAMPLE_TRACE` | `0` | Verbose sampling timing logs |
 
 ## Notes
 
-- **No API key required** — crane-oai does not authenticate requests.
-- **Single CUDA device** — The server uses CUDA device 0. Multi-GPU tensor parallelism is not yet supported.
-- **KV eviction is lossless** — Evicted sequences preserve their full state and resume automatically; in-flight requests are not dropped or errored.
-- **`--max-seq-len 0`** means no limit. On constrained hardware, always set an explicit value to avoid runaway memory growth.
-- **GGUF quantization** is supported for Hunyuan Dense and Qwen 3. Qwen 2.5 requires Safetensors format.
-- **`--decode-tokens-per-seq`** controls decode rounds per engine step, not per request. Requests always complete fully regardless of this value.
-- **Log diagnostics** — The startup log prints `kv_bytes` and `kv_budget`. Monitor these to validate your `--gpu-memory-limit` headroom.
-- **Qwen3-TTS runs on a dedicated thread** — No continuous batching; each `/v1/audio/speech` request is processed sequentially. Concurrent requests are queued in an unbounded channel.
-- **Qwen3-TTS decoder backend** — The speech-tokenizer decoder (codes → waveform) uses native Candle by default. ONNX export is optional as a compatibility fallback.
+- The active API surface is text generation, tokenization, model metadata, and server health.
+- Qwen3 chat templates are loaded from `tokenizer_config.json` when available, with a Qwen3 fallback template.
+- On CUDA BF16, paged-KV native append and GPU gather extraction are enabled by default. Decode-only paged attention is available but **off by default** because the current kernel regresses end-to-end throughput on Qwen3 short/medium translation contexts compared to the contiguous GQA path. Set `CRANE_PAGED_KV_ATTENTION=1` to opt in (and optionally tune `CRANE_PAGED_KV_ATTENTION_MIN_SEQ_LEN` for profiling); set `CRANE_PAGED_KV_NATIVE_APPEND=0` to return to the contiguous KV fallback.
 
-## Testing
+## Qwen3 Runtime Flags
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CRANE_PAGED_KV_NATIVE_APPEND` | on for CUDA BF16 | Copy/import past and generated K/V into GPU pages. |
+| `CRANE_PAGED_KV_GATHER_EXTRACT` | on for CUDA BF16 | Gather page-backed K/V into per-sequence state after a batch step. |
+| `CRANE_PAGED_KV_ATTENTION` | **off** (opt-in) | Allow GPU page-backed BF16 decode attention when rows are resident and the heuristic passes. Currently regresses throughput on Qwen3 short/medium contexts; enable explicitly only when profiling the paged attention kernel. |
+| `CRANE_PAGED_KV_ATTENTION_MIN_SEQ_LEN` | `1024` | Minimum max past length in the batch before the current paged attention kernel is used. |
+| `CRANE_PAGED_KV_ATTENTION_MIN_ACTIVE_ROWS` | `1` | Minimum live rows before paged attention is considered. |
+| `CRANE_PAGED_KV_BLOCK_SIZE` | `16` | Tokens per KV page. |
+| `CRANE_PAGED_KV_PRESSURE_RESERVE_MB` | `512` | Memory headroom reserved near the GPU memory limit. |
+| `CRANE_PAGED_KV_SHADOW_VALIDATE` | off | Debug-only page-store gather validation. |
+| `CRANE_PROFILE` | off | Emit per-stage structured timing logs for short profiling runs. |
+| `CRANE_PAGED_KV_BATCHED_SETUP` | **off** (opt-in, experimental) | Round 9 batched KV setup fast path. Currently produces garbled output after a few batches on this workload; do not enable in production. |
+
+## CUDA Graph Flags (advanced, opt-in)
+
+Graph capture is disabled by default because the eager path is at parity or
+slightly faster on the validated translation workload. The flags below are
+useful when batch shapes are very stable (long completions, fixed batch
+widths). All are read at server start.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CRANE_CUDA_GRAPH_DECODE` | off | Master switch for the CUDA Graph decode path. |
+| `CRANE_CUDA_GRAPH_DECODE_CAPTURE` | off | Capture and replay decode graphs (requires the master switch). |
+| `CRANE_CUDA_GRAPH_DECODE_WIDTH_BUCKET` | **on** | Bucket the cache width to the next power of two so successive batches share captured graphs. Safe with capture off; provides ~6–10% throughput when capture is on. |
+| `CRANE_CUDA_GRAPH_DECODE_CAPTURE_SAMPLING` | off | Capture greedy argmax inside the decode graph. Only fires for greedy, no-penalty workloads. |
+| `CRANE_CUDA_GRAPH_DECODE_BUCKETS` | adaptive | Override the batch-size buckets used for graph capture (e.g. `1,2,4,8,16,32`). |
+| `CRANE_CUDA_GRAPH_DECODE_MAX_REPLAYS` | unbounded | Evict and recapture a graph after this many replays (debugging). |
+| `CRANE_DISABLE_GPU_MEM_HARD_CHECK` | off | Bypass the hard KV-cache VRAM check; required by some CUDA Graph configurations on tight VRAM. |
+
+Recommended graph-on configuration (only enable after validating on your
+workload):
 
 ```bash
-# All unit tests (125 crane-oai + 11 crane-core)
-cargo test -p crane-oai
-cargo test -p crane-core
-
-# Specific modules
-cargo test -p crane-oai engine::scheduler
-cargo test -p crane-oai openai_api::tests
-cargo test -p crane-oai sglang_api::tests
-cargo test -p crane-core autotokenizer
+CRANE_CUDA_GRAPH_DECODE=1 \
+CRANE_CUDA_GRAPH_DECODE_CAPTURE=1 \
+CRANE_DISABLE_GPU_MEM_HARD_CHECK=1 \
+./target/release/crane-oai --model-path ... --port 8000
 ```
-
-## License
-
-MIT

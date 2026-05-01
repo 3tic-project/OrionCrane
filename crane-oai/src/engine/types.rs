@@ -120,21 +120,9 @@ mod tests {
             request_tx: tx,
             stats: Arc::new(EngineStats::new()),
         };
-        let result = handle.submit(
-            "test-2".into(),
-            vec![1],
-            10,
-            None,
-            None,
-            None,
-            1.0,
-            vec![0],
-        );
+        let result = handle.submit("test-2".into(), vec![1], 10, None, None, None, 1.0, vec![0]);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("shut down"));
+        assert!(result.unwrap_err().to_string().contains("shut down"));
     }
 
     #[test]
@@ -166,7 +154,12 @@ mod tests {
             completion_tokens: 2,
             finish_reason: "stop".into(),
         };
-        if let EngineResponse::Finished { prompt_tokens, completion_tokens, .. } = &finished {
+        if let EngineResponse::Finished {
+            prompt_tokens,
+            completion_tokens,
+            ..
+        } = &finished
+        {
             assert_eq!(*prompt_tokens, 5);
             assert_eq!(*completion_tokens, 2);
         }
@@ -198,16 +191,18 @@ mod tests {
             stats: Arc::new(EngineStats::new()),
         };
 
-        let _resp_rx = handle.submit(
-            "req-42".into(),
-            vec![10, 20, 30],
-            100,
-            Some(0.7),
-            Some(0.9),
-            None,
-            1.1,
-            vec![2],
-        ).unwrap();
+        let _resp_rx = handle
+            .submit(
+                "req-42".into(),
+                vec![10, 20, 30],
+                100,
+                Some(0.7),
+                Some(0.9),
+                None,
+                1.1,
+                vec![2],
+            )
+            .unwrap();
 
         let req = rx.recv().await.unwrap();
         assert_eq!(req.id, "req-42");

@@ -3,7 +3,6 @@
 //! Covers:
 //! * `/v1/chat/completions`  (chat)
 //! * `/v1/completions`       (text completion)
-//! * `/v1/audio/speech`      (text-to-speech)
 //! * `/v1/models`            (model listing + retrieval)
 //! * `/v1/tokenize`          (tokenization)
 //! * `/v1/detokenize`        (detokenization)
@@ -59,65 +58,32 @@ pub struct ChatMessage {
 
 impl ChatMessage {
     /// Extract the plain text content from the message.
-    /// For multimodal messages, concatenates all text parts.
+    /// For structured text messages, concatenates all text parts.
     pub fn text_content(&self) -> String {
         match &self.content {
             ChatMessageContent::Text(s) => s.clone(),
             ChatMessageContent::Parts(parts) => parts
                 .iter()
-                .filter_map(|p| match p {
-                    ContentPart::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
+                .map(|p| p.text.as_str())
                 .collect::<Vec<_>>()
                 .join(""),
         }
     }
-
-    /// Extract image URLs from multimodal content.
-    pub fn image_urls(&self) -> Vec<String> {
-        match &self.content {
-            ChatMessageContent::Text(_) => vec![],
-            ChatMessageContent::Parts(parts) => parts
-                .iter()
-                .filter_map(|p| match p {
-                    ContentPart::ImageUrl { image_url } => Some(image_url.url.clone()),
-                    _ => None,
-                })
-                .collect(),
-        }
-    }
 }
 
-/// Chat message content — either a plain string or structured multimodal parts.
+/// Chat message content, either a plain string or structured text parts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ChatMessageContent {
-    /// Plain text content (backward compatible).
     Text(String),
-    /// Structured content with text and/or image_url parts.
     Parts(Vec<ContentPart>),
 }
 
-/// A single content part in a multimodal message.
+/// A single text content part.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ContentPart {
-    /// Text content.
+pub struct ContentPart {
     #[serde(rename = "text")]
-    Text { text: String },
-    /// Image URL content.
-    #[serde(rename = "image_url")]
-    ImageUrl { image_url: ImageUrl },
-    /// Image content (alternative key used by some OpenAI clients).
-    #[serde(rename = "image")]
-    Image { image_url: Option<ImageUrl> },
-}
-
-/// An image URL reference.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImageUrl {
-    pub url: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -298,74 +264,6 @@ pub struct DetokenizeResponse {
 }
 
 // ═════════════════════════════════════════════════════════════
-//  Audio Speech  (/v1/audio/speech)
-// ═════════════════════════════════════════════════════════════
-
-/// Audio response format.
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum AudioResponseFormat {
-    #[default]
-    Wav,
-    Pcm,
-    Mp3,
-    Opus,
-    Aac,
-    Flac,
-}
-
-fn default_speed() -> f64 {
-    1.0
-}
-
-fn default_audio_max_tokens() -> usize {
-    8192
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct SpeechRequest {
-    /// Model ID (e.g. "qwen3-tts").
-    pub model: String,
-    /// The text to synthesize.
-    pub input: String,
-    /// Voice name (speaker ID or preset for CustomVoice models).
-    #[serde(default)]
-    pub voice: Option<String>,
-    /// Language hint (e.g. "chinese", "english", "japanese", "auto").
-    #[serde(default)]
-    pub language: Option<String>,
-    /// Optional system-level instructions.
-    #[serde(default)]
-    pub instructions: Option<String>,
-    /// Response audio format.
-    #[serde(default)]
-    pub response_format: AudioResponseFormat,
-    /// Speaking speed multiplier (currently unused, reserved).
-    #[serde(default = "default_speed")]
-    pub speed: f64,
-    /// Generation temperature.
-    pub temperature: Option<f64>,
-    /// Nucleus sampling top-p.
-    pub top_p: Option<f64>,
-    /// Repetition penalty.
-    pub repetition_penalty: Option<f32>,
-    /// Max codec tokens to generate (controls max duration).
-    #[serde(default = "default_audio_max_tokens")]
-    pub max_tokens: usize,
-
-    // ── Voice-clone fields (Base model only) ──────────────────
-
-    /// URL or local path to reference audio for voice cloning.
-    /// When set, triggers voice-clone mode (requires Base model).
-    #[serde(default)]
-    pub reference_audio: Option<String>,
-    /// Transcript of the reference audio (required for voice cloning).
-    #[serde(default)]
-    pub reference_text: Option<String>,
-}
-
-// ═════════════════════════════════════════════════════════════
 //  Common types
 // ═════════════════════════════════════════════════════════════
 
@@ -454,12 +352,12 @@ mod tests {
     fn chat_message_serde_roundtrip() {
         let msg = ChatMessage {
             role: "user".into(),
-            content: "Hello!".into(),
+            content: ChatMessageContent::Text("Hello!".into()),
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ChatMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.role, "user");
-        assert_eq!(parsed.content, "Hello!");
+        assert_eq!(parsed.text_content(), "Hello!");
     }
 
     // ── ChatCompletionRequest deserialization ──
@@ -577,7 +475,7 @@ mod tests {
                 index: 0,
                 message: ChatMessage {
                     role: "assistant".into(),
-                    content: "Hello!".into(),
+                    content: ChatMessageContent::Text("Hello!".into()),
                 },
                 finish_reason: Some("stop".into()),
             }],
