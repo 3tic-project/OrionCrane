@@ -1,0 +1,20 @@
+[package]
+name = "ug-cuda"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+
+[dependencies]
+cudarc = { workspace = true }
+half = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+ug = { workspace = true }
+
+[dev-dependencies]
+clap = { workspace = true }
+rand = { workspace = true }

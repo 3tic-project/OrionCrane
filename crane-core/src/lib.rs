@@ -9,7 +9,7 @@
 //! | Module | Purpose |
 //! |---|---|
 //! | [`fused_ops`] | Custom CUDA kernels (silu-mul, argmax, top-k, HtoD/DtoD copies) |
-//! | [`models`] | Transformer model implementations (Qwen3, HunyuanDense, Qwen2.5, multimodal) |
+//! | [`models`] | Qwen3 transformer model implementation |
 //! | [`generation`] | Token generation utilities (sampling, stopping criteria, logit processors) |
 //! | [`autotokenizer`] | HuggingFace-compatible tokenizer loader |
 //! | [`chat`] | Chat-template rendering and message formatting |

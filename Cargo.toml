@@ -1,3 +1,34 @@
 [workspace]
-members = ["crane-core", "crane", "crane-oai", "example"]
+members = ["crane-core", "crane-oai"]
+# lib/candle and lib/ug are vendored upstream workspaces; exclude so they
+# resolve their own `workspace.package.*` inheritance from their own
+# Cargo.toml instead of ours.
+exclude = ["lib/candle", "lib/ug"]
 resolver = "2"
+
+# CUDA dynamic-loading: vendored mayocream forks of candle / ug switch cudarc
+# from `dynamic-linking` to `dynamic-loading`. The release binary then
+# `dlopen`s libcuda.so / libcublas.so / libcurand.so / libnvrtc.so / etc. at
+# runtime instead of linking them at build time, so the engine can be
+# packaged without a CUDA toolkit on the host.
+#
+# The local `lib/cudarc` patch (0.19.4) overrides cudarc 0.19.x for candle.
+# ug pulls cudarc 0.17.3 (different SemVer) directly from crates.io with the
+# `dynamic-loading` feature already requested by mayocream/ug — both coexist.
+#
+# float8 stays unpatched on purpose: mayocream's candle uses float8 0.7.0
+# from crates.io and removed `float8/cuda` from candle-core's `cuda` feature,
+# so float8 never pulls cudarc.
+#
+# To refresh the vendored sources:
+#   rm -rf lib/candle lib/ug
+#   git clone --depth 1 -b cuda-dynamic-loading https://github.com/mayocream/candle lib/candle
+#   git clone --depth 1 -b cuda-dynamic-loading https://github.com/mayocream/ug     lib/ug
+#   rm -rf lib/candle/.git lib/ug/.git
+[patch.crates-io]
+candle-core         = { path = "lib/candle/candle-core" }
+candle-nn           = { path = "lib/candle/candle-nn" }
+candle-transformers = { path = "lib/candle/candle-transformers" }
+ug                  = { path = "lib/ug/ug-core" }
+ug-cuda             = { path = "lib/ug/ug-cuda" }
+cudarc              = { path = "lib/cudarc" }

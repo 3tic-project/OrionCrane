@@ -5,7 +5,7 @@
 //!
 //! * **[`AutoChatTemplate`]** — uses the Jinja `chat_template` from
 //!   `tokenizer_config.json` (works for Qwen, Llama, Mistral, …).
-//! * **[`HunyuanChatTemplate`]** — hardcoded template for Hunyuan models.
+//! * **[`Qwen3ChatTemplate`]** — hardcoded Qwen3 fallback template.
 
 use crate::openai_api::ChatMessage;
 use crane_core::autotokenizer::AutoTokenizer;
@@ -56,56 +56,37 @@ impl ChatTemplateProcessor for AutoChatTemplate {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  HunyuanChatTemplate (hardcoded)
+//  Qwen3ChatTemplate (hardcoded fallback)
 // ─────────────────────────────────────────────────────────────
 
-/// Hardcoded chat template for Hunyuan Dense models.
-pub struct HunyuanChatTemplate;
+/// Hardcoded fallback chat template for Qwen3 chat models.
+pub struct Qwen3ChatTemplate;
 
-impl ChatTemplateProcessor for HunyuanChatTemplate {
+impl ChatTemplateProcessor for Qwen3ChatTemplate {
     fn apply(&self, messages: &[ChatMessage]) -> Result<String, String> {
-        const BOS: &str = "<\u{ff5c}hy_begin\u{2581}of\u{2581}sentence\u{ff5c}>";
-        const USER: &str = "<\u{ff5c}hy_User\u{ff5c}>";
-        const ASSISTANT: &str = "<\u{ff5c}hy_Assistant\u{ff5c}>";
-        const EOS: &str = "<\u{ff5c}hy_place\u{2581}holder\u{2581}no\u{2581}2\u{ff5c}>";
-        const SEP: &str = "<\u{ff5c}hy_place\u{2581}holder\u{2581}no\u{2581}3\u{ff5c}>";
-
         let mut result = String::new();
-        result.push_str(BOS);
-
-        let (system_msg, loop_messages) = if !messages.is_empty() && messages[0].role == "system" {
-            (Some(messages[0].text_content()), &messages[1..])
-        } else {
-            (None, &messages[..])
-        };
-
-        if let Some(sys) = system_msg {
-            result.push_str(&sys);
-            result.push_str(SEP);
-        }
-
-        for msg in loop_messages {
+        for msg in messages {
             match msg.role.as_str() {
-                "user" => {
-                    result.push_str(USER);
+                "system" | "user" | "assistant" => {
+                    result.push_str("<|im_start|>");
+                    result.push_str(&msg.role);
+                    result.push('\n');
                     result.push_str(&msg.text_content());
-                }
-                "assistant" => {
-                    result.push_str(ASSISTANT);
-                    result.push_str(&msg.text_content());
-                    result.push_str(EOS);
+                    result.push_str("<|im_end|>\n");
                 }
                 _ => {}
             }
         }
 
-        result.push_str(ASSISTANT);
+        result.push_str("<|im_start|>assistant\n");
         Ok(result)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::openai_api::ChatMessage;
     use crate::openai_api::ChatMessageContent;
 
     fn make_messages(pairs: &[(&str, &str)]) -> Vec<ChatMessage> {
@@ -118,39 +99,31 @@ mod tests {
             .collect()
     }
 
-    // ── HunyuanChatTemplate ──
+    // ── Qwen3ChatTemplate ──
 
     #[test]
-    fn hunyuan_basic_user_message() {
-        let tmpl = HunyuanChatTemplate;
+    fn qwen3_basic_user_message() {
+        let tmpl = Qwen3ChatTemplate;
         let msgs = make_messages(&[("user", "Hello")]);
         let result = tmpl.apply(&msgs).unwrap();
 
-        // Should start with BOS.
-        assert!(result.starts_with("<\u{ff5c}hy_begin\u{2581}of\u{2581}sentence\u{ff5c}>"));
-        // Should contain user tag + content.
-        assert!(result.contains("<\u{ff5c}hy_User\u{ff5c}>Hello"));
-        // Should end with assistant tag (ready for generation).
-        assert!(result.ends_with("<\u{ff5c}hy_Assistant\u{ff5c}>"));
+        assert!(result.starts_with("<|im_start|>user\nHello<|im_end|>\n"));
+        assert!(result.ends_with("<|im_start|>assistant\n"));
     }
 
     #[test]
-    fn hunyuan_system_message_prepended() {
-        let tmpl = HunyuanChatTemplate;
-        let msgs = make_messages(&[
-            ("system", "You are helpful"),
-            ("user", "Hi"),
-        ]);
+    fn qwen3_system_message_prepended() {
+        let tmpl = Qwen3ChatTemplate;
+        let msgs = make_messages(&[("system", "You are helpful"), ("user", "Hi")]);
         let result = tmpl.apply(&msgs).unwrap();
 
-        // System content should appear after BOS followed by SEP.
-        let sep = "<\u{ff5c}hy_place\u{2581}holder\u{2581}no\u{2581}3\u{ff5c}>";
-        assert!(result.contains(&format!("You are helpful{sep}")));
+        assert!(result.contains("<|im_start|>system\nYou are helpful<|im_end|>\n"));
+        assert!(result.contains("<|im_start|>user\nHi<|im_end|>\n"));
     }
 
     #[test]
-    fn hunyuan_multi_turn() {
-        let tmpl = HunyuanChatTemplate;
+    fn qwen3_multi_turn() {
+        let tmpl = Qwen3ChatTemplate;
         let msgs = make_messages(&[
             ("user", "Hello"),
             ("assistant", "Hi!"),
@@ -158,42 +131,36 @@ mod tests {
         ]);
         let result = tmpl.apply(&msgs).unwrap();
 
-        let eos = "<\u{ff5c}hy_place\u{2581}holder\u{2581}no\u{2581}2\u{ff5c}>";
-        // Assistant response should end with EOS.
-        assert!(result.contains(&format!("Hi!{eos}")));
-        // Second user message present.
+        assert!(result.contains("<|im_start|>assistant\nHi!<|im_end|>\n"));
         assert!(result.contains("How are you?"));
     }
 
     #[test]
-    fn hunyuan_empty_messages() {
-        let tmpl = HunyuanChatTemplate;
+    fn qwen3_empty_messages() {
+        let tmpl = Qwen3ChatTemplate;
         let msgs: Vec<ChatMessage> = vec![];
         let result = tmpl.apply(&msgs).unwrap();
 
-        // Should at least have BOS + ASSISTANT.
-        assert!(result.starts_with("<\u{ff5c}hy_begin\u{2581}of\u{2581}sentence\u{ff5c}>"));
-        assert!(result.ends_with("<\u{ff5c}hy_Assistant\u{ff5c}>"));
+        assert_eq!(result, "<|im_start|>assistant\n");
     }
 
     #[test]
-    fn hunyuan_unknown_role_skipped() {
-        let tmpl = HunyuanChatTemplate;
+    fn qwen3_unknown_role_skipped() {
+        let tmpl = Qwen3ChatTemplate;
         let msgs = make_messages(&[
             ("user", "Hello"),
             ("tool", "some tool output"),
             ("user", "Next"),
         ]);
         let result = tmpl.apply(&msgs).unwrap();
-        // "tool" content should not appear with any tag.
         assert!(!result.contains("some tool output"));
     }
 
     // ── ChatTemplateProcessor trait ──
 
     #[test]
-    fn hunyuan_implements_trait() {
-        let proc: Box<dyn ChatTemplateProcessor> = Box::new(HunyuanChatTemplate);
+    fn qwen3_implements_trait() {
+        let proc: Box<dyn ChatTemplateProcessor> = Box::new(Qwen3ChatTemplate);
         let msgs = make_messages(&[("user", "test")]);
         assert!(proc.apply(&msgs).is_ok());
     }
