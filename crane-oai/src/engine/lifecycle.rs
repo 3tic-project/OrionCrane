@@ -162,7 +162,7 @@ impl InferenceEngine {
         debug!(id = %seq_id, "Sequence cleaned up");
     }
 
-    fn clear_idle_request_cache_state(&mut self) {
+    pub(super) fn clear_idle_request_cache_state(&mut self) {
         self.pending_batched_kv_extract = None;
         self.model.clear_kv_cache();
         let released_workspace_layers = self.model.release_batch_decode_workspaces();

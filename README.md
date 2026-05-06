@@ -126,6 +126,8 @@ Adaptive defaults: budget=19.3G (source=free VRAM) max_concurrent=28 (auto=28, u
 | `--max-seq-len` | 2800 | 提示词与输出总长度上限，`0` 表示不限制。 |
 | `--gpu-memory-limit` | 不设置 | 可以写绝对值如 `8G`，或比例如 `0.85`。 |
 
+CUDA 版本默认启用空闲显存整理：当 engine 完全空闲 `120s` 后，会清理请求级 workspace，并调用 `cuMemPoolTrimTo(pool, 0)` 将 CUDA async memory pool 的空闲保留显存还给驱动。可用 `CRANE_IDLE_CUDA_MEM_TRIM_SECS=0` 关闭，或设置更短秒数用于验证。该机制不会卸载模型权重，因此目标是回到“模型加载后的启动基线”附近，而不是进程退出后的 0 占用。
+
 ## 自适应默认参数
 
 `--max-concurrent` 与 `--decode-tokens-per-seq` 会根据“有效 GPU 预算”自动计算：

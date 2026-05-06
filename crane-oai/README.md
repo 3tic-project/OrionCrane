@@ -91,6 +91,7 @@ materially affects throughput:
 | `CRANE_CUDA_GRAPH_DECODE` | **off** | Eager forward is at parity or ~1% faster on the validated workload. |
 | `CRANE_CUDA_GRAPH_DECODE_CAPTURE` | **off** | Requires the master switch; opt-in only. |
 | `CRANE_CUDA_GRAPH_DECODE_WIDTH_BUCKET` | **on** | Safe with capture off; ~6–10% lift when capture is on. Leave on. |
+| `CRANE_IDLE_CUDA_MEM_TRIM_SECS` | **120** | After the engine is fully idle for this many seconds, synchronize CUDA and call `cuMemPoolTrimTo(pool, 0)` so request-local high-water allocations can return to the driver. Set `0` to disable. |
 
 Only `--max-concurrent` and `--gpu-memory-limit` are deployment-specific and
 should be tuned to the available VRAM and target concurrency.
@@ -151,6 +152,7 @@ curl http://localhost:8000/v1/chat/completions \
 | `CRANE_PROFILE` | off | Emit per-stage structured timing logs for short profiling runs. |
 | `CRANE_PAGED_KV_BATCHED_SETUP` | **off** (opt-in) | M2 batched KV setup path. Publishes page-gathered batched KV for the next setup and falls back to per-row materialization when disabled. Validated on the Orion Qwen3 translation probe; keep opt-in until more workload coverage is collected. |
 | `CRANE_BATCH_KV_RAGGED_COPY` | on for CUDA BF16 | Replaces `narrow + contiguous + slice_set` loops in ragged batched setup with a right-aligned BF16 copy kernel. Set `0` only for profiling the legacy rowwise path. |
+| `CRANE_IDLE_CUDA_MEM_TRIM_SECS` | `120` | When no requests are active, wait this many seconds, clear request-local workspaces, synchronize CUDA, and trim the CUDA async memory pool. This returns idle pool reservations but keeps model weights/context resident; `0` disables it. |
 
 ## CUDA Graph Flags (advanced, opt-in)
 

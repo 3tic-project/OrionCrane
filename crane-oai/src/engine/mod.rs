@@ -12,7 +12,7 @@
 //!   3. Scheduler picks next batch (prefill > decode)
 //!   4. Prefill step: run full prompt for ONE new sequence
 //!   5. Decode step: batched or sequential forward for running sequences
-//!   6. If idle → blocking wait for new request
+//!   6. If idle → wait for new request while running idle maintenance
 //! ```
 //!
 //! # Module layout
@@ -31,6 +31,7 @@
 
 pub mod backend;
 mod cuda_graph;
+mod cuda_memory;
 mod lifecycle;
 pub mod model_factory;
 pub mod paged_kv;
@@ -48,7 +49,7 @@ pub use types::{EngineHandle, EngineRequest, EngineResponse};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use candle_core::{DType, Device, Tensor};
 use tokio::sync::mpsc;
@@ -227,6 +228,30 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn env_duration_secs(name: &str, default_secs: u64) -> Option<Duration> {
+    let parse_default = || (default_secs > 0).then(|| Duration::from_secs(default_secs));
+    let raw = match std::env::var(name) {
+        Ok(value) => value,
+        Err(_) => return parse_default(),
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return parse_default();
+    }
+    match trimmed.parse::<u64>() {
+        Ok(0) => None,
+        Ok(secs) => Some(Duration::from_secs(secs)),
+        Err(_) => {
+            warn!(
+                value = %trimmed,
+                default_secs,
+                "Could not parse {name}; using default"
+            );
+            parse_default()
+        }
+    }
+}
+
 fn is_cuda_device(_device: &Device) -> bool {
     #[cfg(feature = "cuda")]
     {
@@ -278,6 +303,8 @@ pub struct InferenceEngine {
     paged_kv_allocator: PagedKvAllocator,
     /// Memory configuration for VRAM limits.
     memory_config: MemoryConfig,
+    /// When fully idle for this long, trim CUDA's async memory pool back to the driver.
+    idle_cuda_mem_trim_after: Option<Duration>,
     /// Timestamp of last memory-limit warning (to throttle log spam).
     last_mem_warn: Instant,
     /// Tracked total KV cache bytes across all sequences (not relying on
@@ -447,6 +474,7 @@ impl InferenceEngine {
             sampling_buffers: SamplingBuffers::new(),
             paged_kv_allocator,
             memory_config,
+            idle_cuda_mem_trim_after: env_duration_secs("CRANE_IDLE_CUDA_MEM_TRIM_SECS", 120),
             last_mem_warn: Instant::now() - std::time::Duration::from_secs(60),
             tracked_kv_bytes: 0,
             eviction_cooldown: 0,
@@ -520,6 +548,16 @@ impl InferenceEngine {
                      measurements — opt-in for determinism, not for speedup. \
                      See docs/qwen3/benchmarks/qwen3_round5_cuda_graph_2026_05_08.md."
                 );
+            }
+        }
+        if is_cuda_device(engine.model.device()) {
+            if let Some(after) = engine.idle_cuda_mem_trim_after {
+                info!(
+                    idle_secs = after.as_secs(),
+                    "CRANE_IDLE_CUDA_MEM_TRIM_SECS enabled; idle CUDA memory pool trim will run after the timeout"
+                );
+            } else {
+                info!("CRANE_IDLE_CUDA_MEM_TRIM_SECS=0; idle CUDA memory pool trim disabled");
             }
         }
         let handle = EngineHandle { request_tx, stats };
@@ -734,7 +772,7 @@ impl InferenceEngine {
                         self.log_stats();
                     }
                 }
-                None => match self.request_rx.blocking_recv() {
+                None => match self.wait_for_request_while_idle() {
                     Some(req) => self.accept_request(req),
                     None => {
                         info!("Engine channel closed, shutting down");
@@ -742,6 +780,80 @@ impl InferenceEngine {
                         return;
                     }
                 },
+            }
+        }
+    }
+
+    fn wait_for_request_while_idle(&mut self) -> Option<EngineRequest> {
+        let idle_started = Instant::now();
+        let mut idle_trim_done = false;
+        let idle_poll = Duration::from_millis(20);
+
+        loop {
+            match self.request_rx.try_recv() {
+                Ok(req) => return Some(req),
+                Err(mpsc::error::TryRecvError::Disconnected) => return None,
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+
+            if !idle_trim_done {
+                if let Some(trim_after) = self.idle_cuda_mem_trim_after {
+                    let idle_for = idle_started.elapsed();
+                    if idle_for >= trim_after {
+                        self.run_idle_cuda_memory_trim(idle_for);
+                        idle_trim_done = true;
+                    }
+                }
+            }
+
+            let sleep_for = if idle_trim_done {
+                idle_poll
+            } else if let Some(trim_after) = self.idle_cuda_mem_trim_after {
+                trim_after
+                    .saturating_sub(idle_started.elapsed())
+                    .min(idle_poll)
+            } else {
+                idle_poll
+            };
+            std::thread::sleep(sleep_for.max(Duration::from_millis(1)));
+        }
+    }
+
+    fn run_idle_cuda_memory_trim(&mut self, idle_for: Duration) {
+        self.clear_idle_request_cache_state();
+        match cuda_memory::trim_idle_cuda_memory_pool(self.model.device()) {
+            Ok(Some(report)) => {
+                self.stats
+                    .gpu_memory_used_bytes
+                    .store(report.gpu_used_after_bytes, Ordering::Relaxed);
+                self.stats
+                    .gpu_memory_total_bytes
+                    .store(report.gpu_total_bytes, Ordering::Relaxed);
+                info!(
+                    idle_secs = idle_for.as_secs(),
+                    gpu_before = %format_bytes_engine(report.gpu_used_before_bytes),
+                    gpu_after = %format_bytes_engine(report.gpu_used_after_bytes),
+                    gpu_reclaimed = %format_bytes_engine(report.gpu_reclaimed_bytes()),
+                    pool_reserved_before = %format_optional_bytes_engine(report.pool_reserved_before_bytes),
+                    pool_reserved_after = %format_optional_bytes_engine(report.pool_reserved_after_bytes),
+                    pool_reserved_reclaimed = %format_optional_bytes_engine(report.pool_reserved_reclaimed_bytes()),
+                    pool_used_before = %format_optional_bytes_engine(report.pool_used_before_bytes),
+                    pool_used_after = %format_optional_bytes_engine(report.pool_used_after_bytes),
+                    "trimmed idle CUDA memory pool"
+                );
+            }
+            Ok(None) => {
+                debug!(
+                    idle_secs = idle_for.as_secs(),
+                    "idle CUDA memory pool trim skipped"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    idle_secs = idle_for.as_secs(),
+                    error = %err,
+                    "idle CUDA memory pool trim failed"
+                );
             }
         }
     }
@@ -2971,4 +3083,10 @@ impl InferenceEngine {
         }
         self.recount_kv_bytes();
     }
+}
+
+fn format_optional_bytes_engine(bytes: Option<u64>) -> String {
+    bytes
+        .map(format_bytes_engine)
+        .unwrap_or_else(|| "unknown".to_string())
 }
