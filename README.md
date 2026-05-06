@@ -183,8 +183,10 @@ CUDA 版本默认启用空闲显存整理：当 engine 完全空闲 `120s` 后�
 
 - `CRANE_PAGED_KV_NATIVE_APPEND`，默认开启（CUDA BF16）
 - `CRANE_PAGED_KV_GATHER_EXTRACT`，默认开启（CUDA BF16）
+- `CRANE_PAGED_KV_BATCHED_SETUP`，默认开启，使用已验证的 page-gathered batched KV setup
 - `CRANE_PAGED_KV_ATTENTION`，默认关闭，仅建议分析性能时手动开启
 - `CRANE_CUDA_GRAPH_DECODE` 系列开关，默认关闭
+- `CRANE_DISABLE_GPU_MEM_HARD_CHECK`，默认开启以避免共享 GPU 上 `cuMemGetInfo` 误触发抢占；需要严格执行 `--gpu-memory-limit` 时设为 `0`
 
 当前 `lib/candle/Cargo.toml` 与 `lib/ug/Cargo.toml` 已按 OrionCrane 的实际用途做过裁剪，只保留本项目需要的 workspace member。
 

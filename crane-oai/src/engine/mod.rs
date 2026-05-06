@@ -189,6 +189,10 @@ fn env_flag(name: &str) -> bool {
     env_flag_default(name, false)
 }
 
+fn gpu_mem_hard_check_disabled() -> bool {
+    env_flag_default("CRANE_DISABLE_GPU_MEM_HARD_CHECK", true)
+}
+
 fn env_flag_default(name: &str, default: bool) -> bool {
     match std::env::var(name).ok().as_deref() {
         Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES") | Some("on")
@@ -652,9 +656,9 @@ impl InferenceEngine {
                 warn!(
                     "gpu_memory_limit ({}) <= model baseline ({}). \
                      KV-cache budget is 0 — all sequences will be immediately preempted. \
-                     Set CRANE_DISABLE_GPU_MEM_HARD_CHECK=1 to bypass on shared GPUs \
+                     CRANE_DISABLE_GPU_MEM_HARD_CHECK defaults to 1 to bypass on shared GPUs \
                      (the baseline is recorded via cuMemGetInfo which sees the WHOLE device, \
-                     including memory used by other processes).",
+                     including memory used by other processes). Set it to 0 to enforce this limit.",
                     format_bytes_engine(limit),
                     format_bytes_engine(baseline),
                 );
@@ -694,12 +698,13 @@ impl InferenceEngine {
                 "CRANE_SCHED_WAIT_BATCH enabled: scheduler will wait briefly for in-flight requests when batch < target"
             );
         }
-        if env_flag("CRANE_DISABLE_GPU_MEM_HARD_CHECK") {
+        if gpu_mem_hard_check_disabled() {
             warn!(
-                "CRANE_DISABLE_GPU_MEM_HARD_CHECK=1: KV-budget eviction disabled. \
-                 The engine will rely on tracked_kv_bytes only and will NOT preempt under memory \
-                 pressure. Use this only on shared GPUs (where cuMemGetInfo is polluted by other \
-                 processes) or when you're confident your workload fits in VRAM."
+                "CRANE_DISABLE_GPU_MEM_HARD_CHECK defaults to 1: KV-budget eviction disabled. \
+                 The engine will not preempt based on --gpu-memory-limit. Use this only on shared \
+                 GPUs (where cuMemGetInfo is polluted by other processes) or when you're confident \
+                 max_concurrent and max_seq_len keep the workload within VRAM. Set \
+                 CRANE_DISABLE_GPU_MEM_HARD_CHECK=0 to re-enable gpu_memory_limit enforcement."
             );
         }
 
@@ -984,7 +989,7 @@ impl InferenceEngine {
         // and max_seq_len). Without this knob, every prefill triggers a
         // false-positive eviction, capping `effective_max_running` at zero
         // and starving batched decode entirely.
-        if env_flag("CRANE_DISABLE_GPU_MEM_HARD_CHECK") {
+        if gpu_mem_hard_check_disabled() {
             return false;
         }
 
@@ -1016,10 +1021,10 @@ impl InferenceEngine {
         // including memory consumed by other processes. That can trigger a
         // false-positive eviction loop on every prefill (capping
         // `effective_max_running` to 0 → engine permanently stuck at batch=1
-        // → batched decode never fires). Set `CRANE_DISABLE_GPU_MEM_HARD_CHECK=1`
-        // when running on a shared device to disable this check and rely on
-        // `tracked_kv_bytes` budgeting only.
-        if self.eviction_cooldown == 0 && !env_flag("CRANE_DISABLE_GPU_MEM_HARD_CHECK") {
+        // → batched decode never fires). `CRANE_DISABLE_GPU_MEM_HARD_CHECK`
+        // defaults to 1 for the optimized shared-GPU deployment profile; set
+        // it to 0 when strict `--gpu-memory-limit` enforcement is required.
+        if self.eviction_cooldown == 0 && !gpu_mem_hard_check_disabled() {
             let (gpu_used, _) = query_gpu_memory_usage(self.model.device());
             if gpu_used > 0 && gpu_used > limit {
                 let now = Instant::now();
@@ -2582,7 +2587,7 @@ impl InferenceEngine {
             let t_extract = Instant::now();
             // M2 batched setup: when enabled, publish the page-gathered batched
             // KV form for the next setup; otherwise materialize per-row caches.
-            let batched_setup_enabled = env_flag_default("CRANE_PAGED_KV_BATCHED_SETUP", false);
+            let batched_setup_enabled = env_flag_default("CRANE_PAGED_KV_BATCHED_SETUP", true);
             let paged_extract = match self.maybe_extract_paged_kv_gather(
                 &batch,
                 &kv_lens,

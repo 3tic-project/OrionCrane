@@ -86,11 +86,12 @@ materially affects throughput:
 | `CRANE_PAGED_KV_NATIVE_APPEND` | **on** (CUDA BF16) | Source of the Round 9 win; collapses per-token KV materialisation kernels. |
 | `CRANE_PAGED_KV_GATHER_EXTRACT` | **on** (CUDA BF16) | One-shot gather kernels per layer instead of per-row per-layer. |
 | `CRANE_PAGED_KV_ATTENTION` | **off** | Current paged attention kernel regresses on short/medium contexts; eager GQA wins. |
-| `CRANE_PAGED_KV_BATCHED_SETUP` | **off** | Opt-in M2 batched KV setup path. Correctness validated on the Orion Qwen3 translation probe; keep opt-in while broader workloads are profiled. |
+| `CRANE_PAGED_KV_BATCHED_SETUP` | **on** | Use the validated page-gathered batched KV setup path by default; set `0` to return to per-row materialization for A/B checks. |
 | `CRANE_BATCH_KV_RAGGED_COPY` | **on** (CUDA BF16) | Uses one fused BF16 kernel per layer for ragged batched-setup workspace copies. |
 | `CRANE_CUDA_GRAPH_DECODE` | **off** | Eager forward is at parity or ~1% faster on the validated workload. |
 | `CRANE_CUDA_GRAPH_DECODE_CAPTURE` | **off** | Requires the master switch; opt-in only. |
 | `CRANE_CUDA_GRAPH_DECODE_WIDTH_BUCKET` | **on** | Safe with capture off; ~6–10% lift when capture is on. Leave on. |
+| `CRANE_DISABLE_GPU_MEM_HARD_CHECK` | **on** | Avoid shared-GPU `cuMemGetInfo` false-positive eviction loops in the optimized profile. Set `0` when strict `--gpu-memory-limit` enforcement is required. |
 | `CRANE_IDLE_CUDA_MEM_TRIM_SECS` | **120** | After the engine is fully idle for this many seconds, synchronize CUDA and call `cuMemPoolTrimTo(pool, 0)` so request-local high-water allocations can return to the driver. Set `0` to disable. |
 
 Only `--max-concurrent` and `--gpu-memory-limit` are deployment-specific and
@@ -150,7 +151,7 @@ curl http://localhost:8000/v1/chat/completions \
 | `CRANE_PAGED_KV_PRESSURE_RESERVE_MB` | `512` | Memory headroom reserved near the GPU memory limit. |
 | `CRANE_PAGED_KV_SHADOW_VALIDATE` | off | Debug-only page-store gather validation. |
 | `CRANE_PROFILE` | off | Emit per-stage structured timing logs for short profiling runs. |
-| `CRANE_PAGED_KV_BATCHED_SETUP` | **off** (opt-in) | M2 batched KV setup path. Publishes page-gathered batched KV for the next setup and falls back to per-row materialization when disabled. Validated on the Orion Qwen3 translation probe; keep opt-in until more workload coverage is collected. |
+| `CRANE_PAGED_KV_BATCHED_SETUP` | **on** | Publishes page-gathered batched KV for the next setup. Set `0` to materialize per-row caches after extract for legacy A/B checks. |
 | `CRANE_BATCH_KV_RAGGED_COPY` | on for CUDA BF16 | Replaces `narrow + contiguous + slice_set` loops in ragged batched setup with a right-aligned BF16 copy kernel. Set `0` only for profiling the legacy rowwise path. |
 | `CRANE_IDLE_CUDA_MEM_TRIM_SECS` | `120` | When no requests are active, wait this many seconds, clear request-local workspaces, synchronize CUDA, and trim the CUDA async memory pool. This returns idle pool reservations but keeps model weights/context resident; `0` disables it. |
 
@@ -169,7 +170,7 @@ widths). All are read at server start.
 | `CRANE_CUDA_GRAPH_DECODE_CAPTURE_SAMPLING` | off | Capture greedy argmax inside the decode graph. Only fires for greedy, no-penalty workloads. |
 | `CRANE_CUDA_GRAPH_DECODE_BUCKETS` | adaptive | Override the batch-size buckets used for graph capture (e.g. `1,2,4,8,16,32`). |
 | `CRANE_CUDA_GRAPH_DECODE_MAX_REPLAYS` | unbounded | Evict and recapture a graph after this many replays (debugging). |
-| `CRANE_DISABLE_GPU_MEM_HARD_CHECK` | off | Bypass the hard KV-cache VRAM check; required by some CUDA Graph configurations on tight VRAM. |
+| `CRANE_DISABLE_GPU_MEM_HARD_CHECK` | **on** | Bypass `cuMemGetInfo`/baseline based preemption by default for shared-GPU throughput runs. Set `0` to enforce `--gpu-memory-limit`. |
 
 Recommended graph-on configuration (only enable after validating on your
 workload):
