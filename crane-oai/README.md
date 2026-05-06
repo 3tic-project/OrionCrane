@@ -86,7 +86,8 @@ materially affects throughput:
 | `CRANE_PAGED_KV_NATIVE_APPEND` | **on** (CUDA BF16) | Source of the Round 9 win; collapses per-token KV materialisation kernels. |
 | `CRANE_PAGED_KV_GATHER_EXTRACT` | **on** (CUDA BF16) | One-shot gather kernels per layer instead of per-row per-layer. |
 | `CRANE_PAGED_KV_ATTENTION` | **off** | Current paged attention kernel regresses on short/medium contexts; eager GQA wins. |
-| `CRANE_PAGED_KV_BATCHED_SETUP` | **off** | Round 9 fast path is correctness-broken; do not enable. |
+| `CRANE_PAGED_KV_BATCHED_SETUP` | **off** | Opt-in M2 batched KV setup path. Correctness validated on the Orion Qwen3 translation probe; keep opt-in while broader workloads are profiled. |
+| `CRANE_BATCH_KV_RAGGED_COPY` | **on** (CUDA BF16) | Uses one fused BF16 kernel per layer for ragged batched-setup workspace copies. |
 | `CRANE_CUDA_GRAPH_DECODE` | **off** | Eager forward is at parity or ~1% faster on the validated workload. |
 | `CRANE_CUDA_GRAPH_DECODE_CAPTURE` | **off** | Requires the master switch; opt-in only. |
 | `CRANE_CUDA_GRAPH_DECODE_WIDTH_BUCKET` | **on** | Safe with capture off; ~6–10% lift when capture is on. Leave on. |
@@ -148,7 +149,8 @@ curl http://localhost:8000/v1/chat/completions \
 | `CRANE_PAGED_KV_PRESSURE_RESERVE_MB` | `512` | Memory headroom reserved near the GPU memory limit. |
 | `CRANE_PAGED_KV_SHADOW_VALIDATE` | off | Debug-only page-store gather validation. |
 | `CRANE_PROFILE` | off | Emit per-stage structured timing logs for short profiling runs. |
-| `CRANE_PAGED_KV_BATCHED_SETUP` | **off** (opt-in, experimental) | Round 9 batched KV setup fast path. Currently produces garbled output after a few batches on this workload; do not enable in production. |
+| `CRANE_PAGED_KV_BATCHED_SETUP` | **off** (opt-in) | M2 batched KV setup path. Publishes page-gathered batched KV for the next setup and falls back to per-row materialization when disabled. Validated on the Orion Qwen3 translation probe; keep opt-in until more workload coverage is collected. |
+| `CRANE_BATCH_KV_RAGGED_COPY` | on for CUDA BF16 | Replaces `narrow + contiguous + slice_set` loops in ragged batched setup with a right-aligned BF16 copy kernel. Set `0` only for profiling the legacy rowwise path. |
 
 ## CUDA Graph Flags (advanced, opt-in)
 

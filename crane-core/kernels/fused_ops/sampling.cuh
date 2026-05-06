@@ -148,7 +148,7 @@ extern "C" __global__ void gpu_argmax_phase2(
 
 extern "C" __global__ void gpu_argmax_batch_bf16(
     const __nv_bfloat16 *__restrict__ logits,  // [batch_size, vocab_size]
-    int32_t             *__restrict__ output_tokens,
+    uint32_t            *__restrict__ output_tokens,
     const int batch_size,
     const int vocab_size
 ) {
@@ -206,7 +206,7 @@ extern "C" __global__ void gpu_argmax_batch_bf16(
         }
 
         if (lane_id == 0) {
-            output_tokens[row] = local_idx;
+            output_tokens[row] = (uint32_t)local_idx;
         }
     }
 }

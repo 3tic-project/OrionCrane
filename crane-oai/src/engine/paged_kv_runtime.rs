@@ -35,9 +35,7 @@ struct PagedKvNativeAppendReport {
 ///
 /// Holds the per-layer `(key_batch, value_batch)` tensors of shape
 /// `[batch, kv_heads, max_total_len, head_dim]`, right-aligned per-row inside
-/// `max_total_len`. The next `setup_batch_decode` consumes these directly
-/// (one `slice_set` per layer per K/V plane) instead of materializing
-/// per-row contiguous tensors and then re-stacking them.
+/// `max_total_len`.
 #[derive(Debug, Clone)]
 pub(super) struct BatchedKvExtract {
     /// One `(K, V)` per model layer. `None` means "no data for this layer"
@@ -65,10 +63,7 @@ impl BatchedKvExtract {
             return Ok(out);
         }
         for layer_idx in 0..num_layers {
-            let Some((layer_k, layer_v)) = self
-                .per_layer
-                .get(layer_idx)
-                .and_then(|x| x.as_ref())
+            let Some((layer_k, layer_v)) = self.per_layer.get(layer_idx).and_then(|x| x.as_ref())
             else {
                 continue;
             };
@@ -315,9 +310,13 @@ impl InferenceEngine {
                         "reset idle paged-KV allocator free list"
                     );
                 }
-            } else if self.compact_paged_kv_if_overprovisioned() {
-                debug!("compacted paged-KV allocator after sequence release");
             } else if let Some(store) = self.paged_kv_gpu_store.as_mut() {
+                // Do not compact live paged-KV metadata here.  The GPU page
+                // store is authoritative for rows whose per-sequence caches
+                // have been dropped after batched extraction; compacting only
+                // metadata and releasing storage would leave live sequences
+                // marked GPU-resident while their page contents are gone.
+                // Idle reset above is safe because there are no live rows.
                 if let Err(err) = store.zero_pages(&page_ids) {
                     warn!(id = %seq_id, error = %err, "failed to zero released GPU paged-KV pages");
                 }
@@ -327,62 +326,6 @@ impl InferenceEngine {
                 .fetch_add(released, Ordering::Relaxed);
             self.refresh_paged_kv_stats();
         }
-    }
-
-    fn compact_paged_kv_if_overprovisioned(&mut self) -> bool {
-        if !self.paged_kv_native_append {
-            return false;
-        }
-        let Some(capacity_pages) = self
-            .paged_kv_gpu_store
-            .as_ref()
-            .map(|store| store.capacity_pages())
-        else {
-            return false;
-        };
-        if capacity_pages == 0 || capacity_pages < self.paged_kv_compact_min_capacity_pages {
-            return false;
-        }
-
-        let snapshot = self.paged_kv_allocator.snapshot();
-        if snapshot.live_pages == 0 || snapshot.free_pages == 0 {
-            return false;
-        }
-        let Ok(live_pages) = usize::try_from(snapshot.live_pages) else {
-            return false;
-        };
-        let target_capacity = live_pages.max(1).next_power_of_two();
-        let trigger_capacity = target_capacity.saturating_mul(self.paged_kv_compact_slack_ratio);
-        if capacity_pages < trigger_capacity {
-            return false;
-        }
-
-        let released_capacity_pages = self
-            .paged_kv_gpu_store
-            .as_mut()
-            .map(|store| store.release_cached_storage())
-            .unwrap_or(0);
-        let report = self
-            .paged_kv_allocator
-            .compact_sequences(self.sequences.values_mut().map(|seq| &mut seq.paged_kv));
-        self.stats
-            .total_paged_kv_compactions
-            .fetch_add(1, Ordering::Relaxed);
-        self.stats
-            .total_paged_kv_compacted_pages
-            .fetch_add(report.moved_pages, Ordering::Relaxed);
-        self.stats
-            .total_paged_kv_idle_reset_pages
-            .fetch_add(report.dropped_free_pages, Ordering::Relaxed);
-        info!(
-            live_pages = report.live_pages,
-            moved_pages = report.moved_pages,
-            dropped_free_pages = report.dropped_free_pages,
-            released_capacity_pages,
-            target_capacity_pages = target_capacity,
-            "compacted paged-KV metadata and released overprovisioned GPU page storage"
-        );
-        true
     }
 
     fn skip_paged_kv_gpu_copy_for_pressure(&mut self, stage: &str) -> bool {
@@ -673,8 +616,8 @@ impl InferenceEngine {
                     max_total_len,
                 )
                 .with_context(|| format!("gather paged KV layer {layer} values"))?;
-            gather_kernel_us = gather_kernel_us
-                .saturating_add(t_gather.elapsed().as_micros() as u64);
+            gather_kernel_us =
+                gather_kernel_us.saturating_add(t_gather.elapsed().as_micros() as u64);
             gathered_layers += 1;
             per_layer.push(Some((key_batch, value_batch)));
         }
@@ -770,8 +713,8 @@ impl InferenceEngine {
                     max_total_len,
                 )
                 .with_context(|| format!("regather paged KV layer {layer} values"))?;
-            gather_kernel_us = gather_kernel_us
-                .saturating_add(t_gather.elapsed().as_micros() as u64);
+            gather_kernel_us =
+                gather_kernel_us.saturating_add(t_gather.elapsed().as_micros() as u64);
             gathered_layers += 1;
             per_layer.push(Some((key_batch, value_batch)));
         }
@@ -790,6 +733,37 @@ impl InferenceEngine {
             max_total_len,
             per_row_totals,
         }))
+    }
+
+    pub(super) fn materialize_paged_kv_rows_for_batch(
+        &mut self,
+        batch: &[String],
+        rows: &[usize],
+    ) -> AnyhowResult<bool> {
+        if rows.is_empty() {
+            return Ok(false);
+        }
+
+        let seq_ids: Vec<String> = rows
+            .iter()
+            .filter_map(|&row| batch.get(row).cloned())
+            .collect();
+        if seq_ids.is_empty() {
+            return Ok(false);
+        }
+
+        let Some(extract) = self.gather_batched_kv_for_batch(&seq_ids)? else {
+            return Ok(false);
+        };
+        let per_row = extract.materialize_per_row(self.num_layers)?;
+        for (row, seq_id) in seq_ids.iter().enumerate() {
+            if let Some(seq) = self.sequences.get_mut(seq_id) {
+                if row < per_row.len() {
+                    seq.kv_caches = per_row[row].clone();
+                }
+            }
+        }
+        Ok(true)
     }
 
     pub(super) fn maybe_append_paged_kv_native(

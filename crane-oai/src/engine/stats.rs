@@ -39,6 +39,8 @@ pub struct EngineStats {
     pub total_batch_decode_extract_contiguous_time_us: AtomicU64,
     pub total_batch_decode_extract_cache_clear_time_us: AtomicU64,
     pub total_batch_decode_extract_state_replace_time_us: AtomicU64,
+    pub total_batch_decode_device_token_input_hits: AtomicU64,
+    pub total_batch_decode_device_token_input_tokens: AtomicU64,
     pub total_sequential_decode_calls: AtomicU64,
     pub total_sequential_decode_tokens: AtomicU64,
     pub total_sequential_decode_time_us: AtomicU64,
@@ -92,9 +94,16 @@ pub struct EngineStats {
     /// Round 9: number of times batched setup happened via fresh re-gather
     /// (batch composition changed since the last extract).
     pub total_paged_kv_batched_setup_regather: AtomicU64,
-    /// Round 9: wall time inside the model's batched setup
-    /// (single `slice_set` per layer per K/V plane).
+    /// Round 9: wall time inside the model's batched setup.
     pub total_paged_kv_batched_setup_us: AtomicU64,
+    pub total_paged_kv_batched_setup_equal_length_layers: AtomicU64,
+    pub total_paged_kv_batched_setup_ragged_layers: AtomicU64,
+    pub total_paged_kv_batched_setup_ragged_rows: AtomicU64,
+    pub total_paged_kv_batched_setup_pending_batch_mismatch: AtomicU64,
+    pub total_paged_kv_batched_setup_pending_token_mismatch: AtomicU64,
+    pub total_paged_kv_batched_setup_fallback_per_seq_cache: AtomicU64,
+    pub total_paged_kv_batched_setup_fallback_regather_unavailable: AtomicU64,
+    pub total_paged_kv_batched_setup_fallback_regather_error: AtomicU64,
     pub total_paged_kv_attention_contexts: AtomicU64,
     pub total_paged_kv_attention_decode_calls: AtomicU64,
     pub total_paged_kv_attention_decode_tokens: AtomicU64,
@@ -179,6 +188,8 @@ impl EngineStats {
             total_batch_decode_extract_contiguous_time_us: AtomicU64::new(0),
             total_batch_decode_extract_cache_clear_time_us: AtomicU64::new(0),
             total_batch_decode_extract_state_replace_time_us: AtomicU64::new(0),
+            total_batch_decode_device_token_input_hits: AtomicU64::new(0),
+            total_batch_decode_device_token_input_tokens: AtomicU64::new(0),
             total_sequential_decode_calls: AtomicU64::new(0),
             total_sequential_decode_tokens: AtomicU64::new(0),
             total_sequential_decode_time_us: AtomicU64::new(0),
@@ -220,6 +231,14 @@ impl EngineStats {
             total_paged_kv_batched_setup_hits: AtomicU64::new(0),
             total_paged_kv_batched_setup_regather: AtomicU64::new(0),
             total_paged_kv_batched_setup_us: AtomicU64::new(0),
+            total_paged_kv_batched_setup_equal_length_layers: AtomicU64::new(0),
+            total_paged_kv_batched_setup_ragged_layers: AtomicU64::new(0),
+            total_paged_kv_batched_setup_ragged_rows: AtomicU64::new(0),
+            total_paged_kv_batched_setup_pending_batch_mismatch: AtomicU64::new(0),
+            total_paged_kv_batched_setup_pending_token_mismatch: AtomicU64::new(0),
+            total_paged_kv_batched_setup_fallback_per_seq_cache: AtomicU64::new(0),
+            total_paged_kv_batched_setup_fallback_regather_unavailable: AtomicU64::new(0),
+            total_paged_kv_batched_setup_fallback_regather_error: AtomicU64::new(0),
             total_paged_kv_attention_contexts: AtomicU64::new(0),
             total_paged_kv_attention_decode_calls: AtomicU64::new(0),
             total_paged_kv_attention_decode_tokens: AtomicU64::new(0),
@@ -343,6 +362,12 @@ impl EngineStats {
         let total_batch_decode_extract_state_replace_us = self
             .total_batch_decode_extract_state_replace_time_us
             .load(Ordering::Relaxed);
+        let total_batch_decode_device_token_input_hits = self
+            .total_batch_decode_device_token_input_hits
+            .load(Ordering::Relaxed);
+        let total_batch_decode_device_token_input_tokens = self
+            .total_batch_decode_device_token_input_tokens
+            .load(Ordering::Relaxed);
         let total_sequential_decode_calls =
             self.total_sequential_decode_calls.load(Ordering::Relaxed);
         let total_sequential_decode_tokens =
@@ -399,6 +424,8 @@ impl EngineStats {
                 total_batch_decode_extract_cache_clear_us,
             total_batch_decode_extract_state_replace_time_us:
                 total_batch_decode_extract_state_replace_us,
+            total_batch_decode_device_token_input_hits,
+            total_batch_decode_device_token_input_tokens,
             avg_batch_decode_step_ms: avg_ms(total_batch_decode_us, total_batch_decode_calls),
             avg_batch_decode_setup_ms: avg_ms(
                 total_batch_decode_setup_us,
@@ -556,6 +583,30 @@ impl EngineStats {
             total_paged_kv_batched_setup_us: self
                 .total_paged_kv_batched_setup_us
                 .load(Ordering::Relaxed),
+            total_paged_kv_batched_setup_equal_length_layers: self
+                .total_paged_kv_batched_setup_equal_length_layers
+                .load(Ordering::Relaxed),
+            total_paged_kv_batched_setup_ragged_layers: self
+                .total_paged_kv_batched_setup_ragged_layers
+                .load(Ordering::Relaxed),
+            total_paged_kv_batched_setup_ragged_rows: self
+                .total_paged_kv_batched_setup_ragged_rows
+                .load(Ordering::Relaxed),
+            total_paged_kv_batched_setup_pending_batch_mismatch: self
+                .total_paged_kv_batched_setup_pending_batch_mismatch
+                .load(Ordering::Relaxed),
+            total_paged_kv_batched_setup_pending_token_mismatch: self
+                .total_paged_kv_batched_setup_pending_token_mismatch
+                .load(Ordering::Relaxed),
+            total_paged_kv_batched_setup_fallback_per_seq_cache: self
+                .total_paged_kv_batched_setup_fallback_per_seq_cache
+                .load(Ordering::Relaxed),
+            total_paged_kv_batched_setup_fallback_regather_unavailable: self
+                .total_paged_kv_batched_setup_fallback_regather_unavailable
+                .load(Ordering::Relaxed),
+            total_paged_kv_batched_setup_fallback_regather_error: self
+                .total_paged_kv_batched_setup_fallback_regather_error
+                .load(Ordering::Relaxed),
             total_paged_kv_attention_contexts: self
                 .total_paged_kv_attention_contexts
                 .load(Ordering::Relaxed),
@@ -693,6 +744,8 @@ pub struct StatsSnapshot {
     pub total_batch_decode_extract_contiguous_time_us: u64,
     pub total_batch_decode_extract_cache_clear_time_us: u64,
     pub total_batch_decode_extract_state_replace_time_us: u64,
+    pub total_batch_decode_device_token_input_hits: u64,
+    pub total_batch_decode_device_token_input_tokens: u64,
     pub avg_batch_decode_step_ms: f64,
     pub avg_batch_decode_setup_ms: f64,
     pub avg_batch_decode_setup_kv_len_scan_ms: f64,
@@ -749,6 +802,14 @@ pub struct StatsSnapshot {
     pub total_paged_kv_batched_setup_hits: u64,
     pub total_paged_kv_batched_setup_regather: u64,
     pub total_paged_kv_batched_setup_us: u64,
+    pub total_paged_kv_batched_setup_equal_length_layers: u64,
+    pub total_paged_kv_batched_setup_ragged_layers: u64,
+    pub total_paged_kv_batched_setup_ragged_rows: u64,
+    pub total_paged_kv_batched_setup_pending_batch_mismatch: u64,
+    pub total_paged_kv_batched_setup_pending_token_mismatch: u64,
+    pub total_paged_kv_batched_setup_fallback_per_seq_cache: u64,
+    pub total_paged_kv_batched_setup_fallback_regather_unavailable: u64,
+    pub total_paged_kv_batched_setup_fallback_regather_error: u64,
     pub total_paged_kv_attention_contexts: u64,
     pub total_paged_kv_attention_decode_calls: u64,
     pub total_paged_kv_attention_decode_tokens: u64,
@@ -825,6 +886,11 @@ mod tests {
                 .load(Ordering::Relaxed),
             0
         );
+        assert_eq!(
+            s.total_batch_decode_device_token_input_hits
+                .load(Ordering::Relaxed),
+            0
+        );
         assert_eq!(s.total_sequential_decode_calls.load(Ordering::Relaxed), 0);
         assert_eq!(
             s.total_sampling_batch_greedy_tokens.load(Ordering::Relaxed),
@@ -859,6 +925,11 @@ mod tests {
         assert_eq!(s.total_paged_kv_idle_resets.load(Ordering::Relaxed), 0);
         assert_eq!(s.total_paged_kv_pressure_skips.load(Ordering::Relaxed), 0);
         assert_eq!(s.total_paged_kv_gather_extracts.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            s.total_paged_kv_batched_setup_ragged_layers
+                .load(Ordering::Relaxed),
+            0
+        );
         assert_eq!(
             s.total_paged_kv_attention_decode_calls
                 .load(Ordering::Relaxed),
@@ -903,6 +974,10 @@ mod tests {
             .store(12_000, Ordering::Relaxed);
         s.total_batch_decode_extract_state_replace_time_us
             .store(4_000, Ordering::Relaxed);
+        s.total_batch_decode_device_token_input_hits
+            .store(11, Ordering::Relaxed);
+        s.total_batch_decode_device_token_input_tokens
+            .store(88, Ordering::Relaxed);
         s.total_sequential_decode_calls.store(2, Ordering::Relaxed);
         s.total_sequential_decode_tokens.store(8, Ordering::Relaxed);
         s.total_sampling_batch_greedy_calls
@@ -946,18 +1021,40 @@ mod tests {
             .store(21, Ordering::Relaxed);
         s.total_paged_kv_gather_extract_layers
             .store(22, Ordering::Relaxed);
-        s.total_paged_kv_attention_contexts
+        s.total_paged_kv_batched_setup_hits
+            .store(23, Ordering::Relaxed);
+        s.total_paged_kv_batched_setup_regather
+            .store(24, Ordering::Relaxed);
+        s.total_paged_kv_batched_setup_us
+            .store(25, Ordering::Relaxed);
+        s.total_paged_kv_batched_setup_equal_length_layers
+            .store(26, Ordering::Relaxed);
+        s.total_paged_kv_batched_setup_ragged_layers
+            .store(27, Ordering::Relaxed);
+        s.total_paged_kv_batched_setup_ragged_rows
             .store(28, Ordering::Relaxed);
-        s.total_paged_kv_attention_decode_calls
+        s.total_paged_kv_batched_setup_pending_batch_mismatch
             .store(29, Ordering::Relaxed);
-        s.total_paged_kv_attention_decode_tokens
+        s.total_paged_kv_batched_setup_pending_token_mismatch
             .store(30, Ordering::Relaxed);
-        s.total_paged_kv_attention_layer_hits
+        s.total_paged_kv_batched_setup_fallback_per_seq_cache
             .store(31, Ordering::Relaxed);
-        s.total_paged_kv_attention_layer_fallbacks
+        s.total_paged_kv_batched_setup_fallback_regather_unavailable
             .store(32, Ordering::Relaxed);
-        s.total_paged_kv_attention_fallbacks
+        s.total_paged_kv_batched_setup_fallback_regather_error
             .store(33, Ordering::Relaxed);
+        s.total_paged_kv_attention_contexts
+            .store(34, Ordering::Relaxed);
+        s.total_paged_kv_attention_decode_calls
+            .store(35, Ordering::Relaxed);
+        s.total_paged_kv_attention_decode_tokens
+            .store(36, Ordering::Relaxed);
+        s.total_paged_kv_attention_layer_hits
+            .store(37, Ordering::Relaxed);
+        s.total_paged_kv_attention_layer_fallbacks
+            .store(38, Ordering::Relaxed);
+        s.total_paged_kv_attention_fallbacks
+            .store(39, Ordering::Relaxed);
         s.total_cuda_graph_decode_rounds
             .store(34, Ordering::Relaxed);
         s.total_cuda_graph_decode_eligible_rounds
@@ -1018,6 +1115,8 @@ mod tests {
         assert_eq!(snap.total_batch_decode_extract_narrow_time_us, 8_000);
         assert_eq!(snap.total_batch_decode_extract_contiguous_time_us, 12_000);
         assert_eq!(snap.total_batch_decode_extract_state_replace_time_us, 4_000);
+        assert_eq!(snap.total_batch_decode_device_token_input_hits, 11);
+        assert_eq!(snap.total_batch_decode_device_token_input_tokens, 88);
         assert_eq!(snap.total_sequential_decode_calls, 2);
         assert_eq!(snap.total_sequential_decode_tokens, 8);
         assert_eq!(snap.total_sampling_batch_greedy_calls, 6);
@@ -1044,12 +1143,29 @@ mod tests {
         assert_eq!(snap.total_paged_kv_pressure_released_pages, 20);
         assert_eq!(snap.total_paged_kv_gather_extracts, 21);
         assert_eq!(snap.total_paged_kv_gather_extract_layers, 22);
-        assert_eq!(snap.total_paged_kv_attention_contexts, 28);
-        assert_eq!(snap.total_paged_kv_attention_decode_calls, 29);
-        assert_eq!(snap.total_paged_kv_attention_decode_tokens, 30);
-        assert_eq!(snap.total_paged_kv_attention_layer_hits, 31);
-        assert_eq!(snap.total_paged_kv_attention_layer_fallbacks, 32);
-        assert_eq!(snap.total_paged_kv_attention_fallbacks, 33);
+        assert_eq!(snap.total_paged_kv_batched_setup_hits, 23);
+        assert_eq!(snap.total_paged_kv_batched_setup_regather, 24);
+        assert_eq!(snap.total_paged_kv_batched_setup_us, 25);
+        assert_eq!(snap.total_paged_kv_batched_setup_equal_length_layers, 26);
+        assert_eq!(snap.total_paged_kv_batched_setup_ragged_layers, 27);
+        assert_eq!(snap.total_paged_kv_batched_setup_ragged_rows, 28);
+        assert_eq!(snap.total_paged_kv_batched_setup_pending_batch_mismatch, 29);
+        assert_eq!(snap.total_paged_kv_batched_setup_pending_token_mismatch, 30);
+        assert_eq!(snap.total_paged_kv_batched_setup_fallback_per_seq_cache, 31);
+        assert_eq!(
+            snap.total_paged_kv_batched_setup_fallback_regather_unavailable,
+            32
+        );
+        assert_eq!(
+            snap.total_paged_kv_batched_setup_fallback_regather_error,
+            33
+        );
+        assert_eq!(snap.total_paged_kv_attention_contexts, 34);
+        assert_eq!(snap.total_paged_kv_attention_decode_calls, 35);
+        assert_eq!(snap.total_paged_kv_attention_decode_tokens, 36);
+        assert_eq!(snap.total_paged_kv_attention_layer_hits, 37);
+        assert_eq!(snap.total_paged_kv_attention_layer_fallbacks, 38);
+        assert_eq!(snap.total_paged_kv_attention_fallbacks, 39);
         assert_eq!(snap.total_cuda_graph_decode_rounds, 34);
         assert_eq!(snap.total_cuda_graph_decode_eligible_rounds, 35);
         assert_eq!(snap.total_cuda_graph_decode_capture_attempts, 36);

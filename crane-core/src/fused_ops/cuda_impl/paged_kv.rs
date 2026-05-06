@@ -855,6 +855,169 @@ pub fn batch_kv_append_bf16_with_offset(
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn batch_kv_copy_ragged_bf16(
+    dst_k: &Tensor,
+    dst_v: &Tensor,
+    src_k: &Tensor,
+    src_v: &Tensor,
+    kv_lens: &Tensor,
+    num_kv_heads: usize,
+    head_dim: usize,
+) -> Result<()> {
+    if dst_k.dtype() != DType::BF16
+        || dst_v.dtype() != DType::BF16
+        || src_k.dtype() != DType::BF16
+        || src_v.dtype() != DType::BF16
+    {
+        candle_core::bail!("batch_kv_copy_ragged_bf16 expects BF16 K/V tensors")
+    }
+    if kv_lens.dtype() != DType::U32 {
+        candle_core::bail!("batch_kv_copy_ragged_bf16 expects U32 kv_lens")
+    }
+
+    let src_dims = src_k.dims4()?;
+    if src_v.dims4()? != src_dims {
+        candle_core::bail!("batch_kv_copy_ragged_bf16: source K/V shapes differ")
+    }
+    let dst_dims = dst_k.dims4()?;
+    if dst_v.dims4()? != dst_dims {
+        candle_core::bail!("batch_kv_copy_ragged_bf16: destination K/V shapes differ")
+    }
+    let (batch_size, src_heads, src_width, src_head_dim) = src_dims;
+    let (dst_batch, dst_heads, dst_width, dst_head_dim) = dst_dims;
+    if batch_size == 0 || src_width == 0 {
+        return Ok(());
+    }
+    if dst_batch != batch_size
+        || src_heads != num_kv_heads
+        || dst_heads != num_kv_heads
+        || src_head_dim != head_dim
+        || dst_head_dim != head_dim
+        || dst_width < src_width
+    {
+        candle_core::bail!(
+            "batch_kv_copy_ragged_bf16 layout mismatch: src={:?}, dst={:?}, expected heads={num_kv_heads}, head_dim={head_dim}, dst_width>=src_width",
+            src_k.dims(),
+            dst_k.dims()
+        )
+    }
+    if kv_lens.dims() != &[batch_size] {
+        candle_core::bail!(
+            "batch_kv_copy_ragged_bf16 kv_lens shape {:?} does not match batch {batch_size}",
+            kv_lens.dims()
+        )
+    }
+
+    let dev = match dst_k.device() {
+        Device::Cuda(dev) => dev,
+        _ => candle_core::bail!("batch_kv_copy_ragged_bf16 requires CUDA destination"),
+    };
+    for tensor in [dst_v, src_k, src_v, kv_lens] {
+        let same_device = matches!(tensor.device(), Device::Cuda(other) if other.id() == dev.id());
+        if !same_device {
+            candle_core::bail!("batch_kv_copy_ragged_bf16 tensors must share one CUDA device")
+        }
+    }
+
+    let (dst_k_storage, dst_k_layout) = dst_k.storage_and_layout();
+    let dst_k_storage = match &*dst_k_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("batch_kv_copy_ragged_bf16: expected CUDA dst K storage"),
+    };
+    let (dst_k_o1, dst_k_o2) = dst_k_layout.contiguous_offsets().ok_or_else(|| {
+        candle_core::Error::Msg("batch_kv_copy_ragged_bf16: dst K must be contiguous".into())
+    })?;
+
+    let (dst_v_storage, dst_v_layout) = dst_v.storage_and_layout();
+    let dst_v_storage = match &*dst_v_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("batch_kv_copy_ragged_bf16: expected CUDA dst V storage"),
+    };
+    let (dst_v_o1, dst_v_o2) = dst_v_layout.contiguous_offsets().ok_or_else(|| {
+        candle_core::Error::Msg("batch_kv_copy_ragged_bf16: dst V must be contiguous".into())
+    })?;
+
+    let (src_k_storage, src_k_layout) = src_k.storage_and_layout();
+    let src_k_storage = match &*src_k_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("batch_kv_copy_ragged_bf16: expected CUDA src K storage"),
+    };
+    let (src_k_o1, src_k_o2) = src_k_layout.contiguous_offsets().ok_or_else(|| {
+        candle_core::Error::Msg("batch_kv_copy_ragged_bf16: src K must be contiguous".into())
+    })?;
+
+    let (src_v_storage, src_v_layout) = src_v.storage_and_layout();
+    let src_v_storage = match &*src_v_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("batch_kv_copy_ragged_bf16: expected CUDA src V storage"),
+    };
+    let (src_v_o1, src_v_o2) = src_v_layout.contiguous_offsets().ok_or_else(|| {
+        candle_core::Error::Msg("batch_kv_copy_ragged_bf16: src V must be contiguous".into())
+    })?;
+
+    let (kv_lens_storage, kv_lens_layout) = kv_lens.storage_and_layout();
+    let kv_lens_storage = match &*kv_lens_storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("batch_kv_copy_ragged_bf16: expected CUDA kv_lens storage"),
+    };
+    let (kv_lens_o1, kv_lens_o2) = kv_lens_layout.contiguous_offsets().ok_or_else(|| {
+        candle_core::Error::Msg("batch_kv_copy_ragged_bf16: kv_lens must be contiguous".into())
+    })?;
+
+    let cfg = LaunchConfig {
+        grid_dim: (batch_size as u32, src_width as u32, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let func = load_func!(dev, "batch_kv_copy_ragged_bf16")?;
+
+    match (
+        &dst_k_storage.slice,
+        &dst_v_storage.slice,
+        &src_k_storage.slice,
+        &src_v_storage.slice,
+        &kv_lens_storage.slice,
+    ) {
+        (
+            CudaStorageSlice::BF16(dst_k),
+            CudaStorageSlice::BF16(dst_v),
+            CudaStorageSlice::BF16(src_k),
+            CudaStorageSlice::BF16(src_v),
+            CudaStorageSlice::U32(kv_lens),
+        ) => {
+            let dst_k = dst_k.slice(dst_k_o1..dst_k_o2);
+            let dst_v = dst_v.slice(dst_v_o1..dst_v_o2);
+            let src_k = src_k.slice(src_k_o1..src_k_o2);
+            let src_v = src_v.slice(src_v_o1..src_v_o2);
+            let kv_lens = kv_lens.slice(kv_lens_o1..kv_lens_o2);
+            let batch_size_i = batch_size as i32;
+            let src_width_i = src_width as i32;
+            let dst_width_i = dst_width as i32;
+            let num_kv_heads_i = num_kv_heads as i32;
+            let head_dim_i = head_dim as i32;
+            let mut builder = func.builder();
+            builder.arg(&dst_k);
+            builder.arg(&dst_v);
+            builder.arg(&src_k);
+            builder.arg(&src_v);
+            builder.arg(&kv_lens);
+            builder.arg(&batch_size_i);
+            builder.arg(&src_width_i);
+            builder.arg(&dst_width_i);
+            builder.arg(&num_kv_heads_i);
+            builder.arg(&head_dim_i);
+            unsafe { builder.launch(cfg) }.w()?;
+        }
+        _ => candle_core::bail!(
+            "batch_kv_copy_ragged_bf16 expects BF16 CUDA K/V and U32 kv_lens storage"
+        ),
+    }
+
+    Ok(())
+}
+
 /// Append generated BF16 batch-decode K/V tokens into GPU page storage.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]

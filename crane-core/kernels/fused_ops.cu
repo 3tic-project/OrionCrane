@@ -5,7 +5,8 @@
  *
  * This file is intentionally only an aggregation unit. Kernel definitions are
  * grouped under `kernels/fused_ops/` so paged-KV and paged-attention work can
- * evolve without growing a single monolithic CUDA source file.
+ * evolve without growing a single monolithic CUDA source file. Keep this unit
+ * touched when adding exported kernels in included headers so PTX cache refreshes.
  */
 
 #include "fused_ops/common.cuh"

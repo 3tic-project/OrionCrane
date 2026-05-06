@@ -23,6 +23,9 @@ pub struct BatchDecodeSetupTimings {
     pub contiguous_us: u64,
     pub extra_room_alloc_us: u64,
     pub cache_assign_us: u64,
+    pub batched_equal_length_layers: u64,
+    pub batched_ragged_layers: u64,
+    pub batched_ragged_rows: u64,
     pub total_us: u64,
     pub layers: usize,
     pub sequences: usize,
@@ -46,6 +49,9 @@ impl From<crane_core::models::qwen3::modeling::BatchDecodeSetupStats> for BatchD
             contiguous_us: value.contiguous_us,
             extra_room_alloc_us: value.extra_room_alloc_us,
             cache_assign_us: value.cache_assign_us,
+            batched_equal_length_layers: value.batched_equal_length_layers,
+            batched_ragged_layers: value.batched_ragged_layers,
+            batched_ragged_rows: value.batched_ragged_rows,
             total_us: value.total_us,
             layers: value.layers,
             sequences: value.sequences,
@@ -172,6 +178,10 @@ pub trait ModelBackend: Send + 'static {
 
     #[allow(dead_code)]
     fn batch_decode_workspace_generation(&self) -> u64 {
+        0
+    }
+
+    fn release_batch_decode_workspaces(&mut self) -> usize {
         0
     }
 
@@ -416,6 +426,10 @@ impl ModelBackend for Qwen3Backend {
 
     fn batch_decode_workspace_generation(&self) -> u64 {
         self.model.batch_decode_workspace_generation()
+    }
+
+    fn release_batch_decode_workspaces(&mut self) -> usize {
+        self.model.release_batch_decode_workspaces()
     }
 
     fn step_batch_decode(

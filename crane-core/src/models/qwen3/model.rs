@@ -75,6 +75,10 @@ impl Model {
         self.inner.clear_kv_cache();
     }
 
+    pub fn release_batch_decode_workspaces(&mut self) -> usize {
+        self.inner.release_batch_decode_workspaces()
+    }
+
     fn from_pretrained(model_path: &str, device: &Device, dtype: &DType) -> Result<Model> {
         let tokenizer_path = std::path::Path::new(model_path).join("tokenizer.json");
         if !tokenizer_path.exists() {

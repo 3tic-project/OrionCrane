@@ -299,10 +299,6 @@ pub struct InferenceEngine {
     paged_kv_gpu_store: Option<PagedKvGpuPageStore>,
     /// When enabled, append generated batch-decode K/V directly into GPU pages.
     paged_kv_native_append: bool,
-    /// Minimum retained page-store capacity before active compaction is allowed.
-    paged_kv_compact_min_capacity_pages: usize,
-    /// Trigger active compaction when capacity is this multiple of live pages.
-    paged_kv_compact_slack_ratio: usize,
     /// Reserved headroom near the GPU memory limit where validation-only page copies are skipped.
     paged_kv_pressure_reserve_bytes: u64,
     /// Use GPU page gather to rebuild per-sequence K/V caches instead of extracting from batch buffers.
@@ -333,8 +329,7 @@ pub struct InferenceEngine {
     /// extracted for. Consumed by the next `setup_batch_decode` when the batch
     /// composition matches; otherwise dropped and `gather_batched_kv_for_batch`
     /// regathers fresh data for the new batch.
-    pending_batched_kv_extract:
-        Option<(Vec<String>, paged_kv_runtime::BatchedKvExtract)>,
+    pending_batched_kv_extract: Option<(Vec<String>, paged_kv_runtime::BatchedKvExtract)>,
     /// Generation of model-owned batch decode workspaces currently backing captured graphs.
     #[cfg(feature = "cuda")]
     cuda_graph_workspace_generation: u64,
@@ -401,9 +396,6 @@ impl InferenceEngine {
             .max(1);
         let paged_kv_native_append =
             env_flag_default("CRANE_PAGED_KV_NATIVE_APPEND", paged_kv_default_enabled);
-        let paged_kv_compact_min_capacity_pages =
-            env_usize("CRANE_PAGED_KV_COMPACT_MIN_CAPACITY", 1024);
-        let paged_kv_compact_slack_ratio = env_usize("CRANE_PAGED_KV_COMPACT_RATIO", 2).max(2);
         let paged_kv_pressure_reserve_bytes =
             (env_usize("CRANE_PAGED_KV_PRESSURE_RESERVE_MB", 512) as u64) << 20;
         let paged_kv_gather_extract = paged_kv_native_append
@@ -463,8 +455,6 @@ impl InferenceEngine {
             paged_kv_shadow_max_layers,
             paged_kv_gpu_store,
             paged_kv_native_append,
-            paged_kv_compact_min_capacity_pages,
-            paged_kv_compact_slack_ratio,
             paged_kv_pressure_reserve_bytes,
             paged_kv_gather_extract,
             paged_kv_attention,
@@ -500,8 +490,6 @@ impl InferenceEngine {
         if paged_kv_native_append {
             info!(
                 enabled = engine.paged_kv_gpu_store.is_some(),
-                compact_min_capacity_pages = engine.paged_kv_compact_min_capacity_pages,
-                compact_slack_ratio = engine.paged_kv_compact_slack_ratio,
                 pressure_reserve_bytes = engine.paged_kv_pressure_reserve_bytes,
                 gather_extract = engine.paged_kv_gather_extract,
                 paged_attention = engine.paged_kv_attention,
@@ -919,9 +907,7 @@ impl InferenceEngine {
         // → batched decode never fires). Set `CRANE_DISABLE_GPU_MEM_HARD_CHECK=1`
         // when running on a shared device to disable this check and rely on
         // `tracked_kv_bytes` budgeting only.
-        if self.eviction_cooldown == 0
-            && !env_flag("CRANE_DISABLE_GPU_MEM_HARD_CHECK")
-        {
+        if self.eviction_cooldown == 0 && !env_flag("CRANE_DISABLE_GPU_MEM_HARD_CHECK") {
             let (gpu_used, _) = query_gpu_memory_usage(self.model.device());
             if gpu_used > 0 && gpu_used > limit {
                 let now = Instant::now();
@@ -1254,7 +1240,10 @@ impl InferenceEngine {
             .unwrap_or(0);
 
         let t_swap = Instant::now();
-        self.swap_in(&seq_id);
+        if !self.swap_in(&seq_id) {
+            self.send_error(&seq_id, "KV swap-in failed");
+            return;
+        }
         let mut swap_us = t_swap.elapsed().as_micros() as u64;
 
         let (input_ids, start_pos) = {
@@ -1305,6 +1294,12 @@ impl InferenceEngine {
                 return;
             }
         };
+
+        self.maybe_import_paged_kv_batch_past(
+            &std::slice::from_ref(&seq_id),
+            &[prompt_len],
+            prompt_len,
+        );
 
         let t_swap = Instant::now();
         self.swap_out(&seq_id);
@@ -1446,29 +1441,38 @@ impl InferenceEngine {
         // composition changed, attempt to re-gather batched data from the
         // page store. Only fall back to the per-row pad-stack path if neither
         // batched source is available.
-        let pending_match = self
-            .pending_batched_kv_extract
-            .as_ref()
-            .map(|(prev_batch, extract)| {
+        let pending_match =
+            if let Some((prev_batch, extract)) = self.pending_batched_kv_extract.as_ref() {
                 if prev_batch != &batch {
-                    return false;
-                }
-                // Validate per-row totals against current sequence token counts.
-                // If the engine ran a single-seq decode between the prev extract
-                // and this batched setup, the stored extract is stale.
-                prev_batch.iter().enumerate().all(|(row, seq_id)| {
-                    let expected_total = self
-                        .sequences
-                        .get(seq_id)
-                        .map(|seq| seq.paged_kv.token_len());
-                    match (expected_total, extract.per_row_totals.get(row).copied()) {
-                        (Some(actual), Some(Some(stored))) => actual == stored,
-                        (Some(0), Some(None)) => true,
-                        _ => false,
+                    self.stats
+                        .total_paged_kv_batched_setup_pending_batch_mismatch
+                        .fetch_add(1, Ordering::Relaxed);
+                    false
+                } else {
+                    // Validate per-row totals against current sequence token counts.
+                    // If the engine ran a single-seq decode between the prev extract
+                    // and this batched setup, the stored extract is stale.
+                    let token_match = prev_batch.iter().enumerate().all(|(row, seq_id)| {
+                        let expected_total = self
+                            .sequences
+                            .get(seq_id)
+                            .map(|seq| seq.paged_kv.token_len());
+                        match (expected_total, extract.per_row_totals.get(row).copied()) {
+                            (Some(actual), Some(Some(stored))) => actual == stored,
+                            (Some(0), Some(None)) => true,
+                            _ => false,
+                        }
+                    });
+                    if !token_match {
+                        self.stats
+                            .total_paged_kv_batched_setup_pending_token_mismatch
+                            .fetch_add(1, Ordering::Relaxed);
                     }
-                })
-            })
-            .unwrap_or(false);
+                    token_match
+                }
+            } else {
+                false
+            };
         let mut batched_setup: Option<paged_kv_runtime::BatchedKvExtract> = None;
         let mut batched_setup_via_regather = false;
         if pending_match {
@@ -1478,24 +1482,84 @@ impl InferenceEngine {
                 .map(|(_, extract)| extract);
         } else {
             // Drop stale pending; if we have non-empty per-seq kv_caches, prefer
-            // the per-row path (rare: prefill output before any extract).
+            // a fresh page-store gather first. Prefill now imports prompt KV into
+            // the page store before swap-out, so mixed old+new batches can still
+            // use the batched setup path.
             self.pending_batched_kv_extract = None;
-            let has_per_seq_caches = batch.iter().any(|id| {
-                self.sequences
-                    .get(id)
-                    .map(|s| s.kv_caches.iter().any(|c| c.is_some()))
-                    .unwrap_or(false)
-            });
-            if !has_per_seq_caches {
-                match self.gather_batched_kv_for_batch(&batch) {
-                    Ok(Some(extract)) => {
-                        batched_setup = Some(extract);
-                        batched_setup_via_regather = true;
+            match self.gather_batched_kv_for_batch(&batch) {
+                Ok(Some(extract)) => {
+                    batched_setup = Some(extract);
+                    batched_setup_via_regather = true;
+                }
+                Ok(None) => {
+                    let has_per_seq_caches = batch.iter().any(|id| {
+                        self.sequences
+                            .get(id)
+                            .map(|s| s.kv_caches.iter().any(|c| c.is_some()))
+                            .unwrap_or(false)
+                    });
+                    if has_per_seq_caches {
+                        self.stats
+                            .total_paged_kv_batched_setup_fallback_per_seq_cache
+                            .fetch_add(1, Ordering::Relaxed);
+                        let missing_paged_rows: Vec<usize> = batch
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(row, id)| {
+                                let seq = self.sequences.get(id)?;
+                                let has_cache = seq.kv_caches.iter().any(|cache| cache.is_some());
+                                (!has_cache && seq.paged_kv.token_len() > 0).then_some(row)
+                            })
+                            .collect();
+                        if !missing_paged_rows.is_empty() {
+                            match self
+                                .materialize_paged_kv_rows_for_batch(&batch, &missing_paged_rows)
+                            {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    error!(
+                                        rows = ?missing_paged_rows,
+                                        "mixed batch has rows without per-sequence KV caches and paged KV could not be materialized"
+                                    );
+                                    for row in missing_paged_rows {
+                                        if let Some(seq_id) = batch.get(row) {
+                                            self.send_error(
+                                                seq_id,
+                                                "Paged KV mixed-batch setup failed",
+                                            );
+                                        }
+                                    }
+                                    return;
+                                }
+                                Err(err) => {
+                                    error!(
+                                        rows = ?missing_paged_rows,
+                                        error = %err,
+                                        "mixed batch paged-KV materialization failed"
+                                    );
+                                    for row in missing_paged_rows {
+                                        if let Some(seq_id) = batch.get(row) {
+                                            self.send_error(
+                                                seq_id,
+                                                "Paged KV mixed-batch setup failed",
+                                            );
+                                        }
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                    } else {
+                        self.stats
+                            .total_paged_kv_batched_setup_fallback_regather_unavailable
+                            .fetch_add(1, Ordering::Relaxed);
                     }
-                    Ok(None) => {}
-                    Err(err) => {
-                        warn!(error = %err, "paged KV batched re-gather failed; falling back to per-row setup");
-                    }
+                }
+                Err(err) => {
+                    self.stats
+                        .total_paged_kv_batched_setup_fallback_regather_error
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(error = %err, "paged KV batched re-gather failed; falling back to per-row setup");
                 }
             }
         }
@@ -1537,10 +1601,7 @@ impl InferenceEngine {
                 Err(e) => {
                     error!("Batch decode batched setup failed: {e}");
                     for seq_id in &batch {
-                        self.send_error(
-                            seq_id,
-                            &format!("Batch decode batched setup failed: {e}"),
-                        );
+                        self.send_error(seq_id, &format!("Batch decode batched setup failed: {e}"));
                     }
                     return;
                 }
@@ -1561,6 +1622,17 @@ impl InferenceEngine {
             }
         };
         let setup_timings = self.model.last_batch_decode_setup_timings();
+        if batched_setup.is_some() {
+            self.stats
+                .total_paged_kv_batched_setup_equal_length_layers
+                .fetch_add(setup_timings.batched_equal_length_layers, Ordering::Relaxed);
+            self.stats
+                .total_paged_kv_batched_setup_ragged_layers
+                .fetch_add(setup_timings.batched_ragged_layers, Ordering::Relaxed);
+            self.stats
+                .total_paged_kv_batched_setup_ragged_rows
+                .fetch_add(setup_timings.batched_ragged_rows, Ordering::Relaxed);
+        }
         #[cfg(feature = "cuda")]
         {
             let workspace_generation = self.model.batch_decode_workspace_generation();
@@ -1666,6 +1738,9 @@ impl InferenceEngine {
             .iter()
             .map(|id| *self.sequences.get(id).unwrap().tokens.last().unwrap())
             .collect();
+        let mut next_input_ids_device: Option<Tensor> = None;
+        let decode_device_token_input_enabled =
+            env_flag_default("CRANE_DECODE_DEVICE_TOKEN_INPUT", true);
 
         for round in 0..self.decode_tokens_per_seq {
             if alive.iter().all(|a| !a) {
@@ -1677,7 +1752,34 @@ impl InferenceEngine {
                 self.maybe_build_paged_attention_context(&batch, &kv_lens, round, &alive);
             let fixed_width_round =
                 self.cuda_graph_decode.fixed_width_decode() && paged_attention_context.is_none();
-            let input_ids = if fixed_width_round {
+            let use_device_input_ids = decode_device_token_input_enabled
+                && !fixed_width_round
+                && alive.iter().all(|&is_alive| is_alive);
+            let input_ids = if use_device_input_ids {
+                if let Some(t) = next_input_ids_device.take() {
+                    self.stats
+                        .total_batch_decode_device_token_input_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .total_batch_decode_device_token_input_tokens
+                        .fetch_add(batch_size as u64, Ordering::Relaxed);
+                    t
+                } else {
+                    match crane_core::fused_ops::copy_from_slice_u32(
+                        &last_tokens,
+                        self.model.device(),
+                    )
+                    .and_then(|t| t.reshape((batch_size, 1)))
+                    {
+                        Ok(t) => t,
+                        Err(e) => {
+                            error!("Decode input_ids upload failed: {e}");
+                            self.model.clear_kv_cache();
+                            return;
+                        }
+                    }
+                }
+            } else if fixed_width_round {
                 match self
                     .cuda_graph_input_ids
                     .upload_1d(&last_tokens, self.model.device())
@@ -1814,17 +1916,14 @@ impl InferenceEngine {
                         // Used to bisect "capture bug" vs "reuse bug".
                         self.cuda_graph_decode_entries.remove(&key);
                     }
-                    let replay = self
-                        .cuda_graph_decode_entries
-                        .get_mut(&key)
-                        .map(|entry| {
-                            entry.replays_used = entry.replays_used.saturating_add(1);
-                            let sample_batch = entry.captured_sample_batch;
-                            entry
-                                .graph
-                                .launch()
-                                .map(|()| (entry.logits.clone(), sample_batch))
-                        });
+                    let replay = self.cuda_graph_decode_entries.get_mut(&key).map(|entry| {
+                        entry.replays_used = entry.replays_used.saturating_add(1);
+                        let sample_batch = entry.captured_sample_batch;
+                        entry
+                            .graph
+                            .launch()
+                            .map(|()| (entry.logits.clone(), sample_batch))
+                    });
                     match replay {
                         Some(Ok((logits, sample_batch))) => {
                             self.record_cuda_graph_decode_replay(active_rows);
@@ -1979,6 +2078,7 @@ impl InferenceEngine {
                         .get(seq_id)
                         .map_or(false, sampling::is_greedy)
             });
+            let mut batch_greedy_device_tokens: Option<Tensor> = None;
             // P4-A: when sampling was captured into the decode graph and no row
             // needs a repetition penalty, we can read the tokens from the
             // engine-owned device buffer with a single DtoH that subsumes the
@@ -2057,13 +2157,15 @@ impl InferenceEngine {
                     Ok(sample) if sample.tokens.len() == batch.len() => {
                         sampling_us += t_sampling.elapsed().as_micros() as u64;
                         let active_rows = alive.iter().filter(|&&is_alive| is_alive).count() as u64;
+                        let mode = sample.mode;
+                        batch_greedy_device_tokens = sample.device_tokens;
                         self.stats
                             .total_sampling_batch_greedy_calls
                             .fetch_add(1, Ordering::Relaxed);
                         self.stats
                             .total_sampling_batch_greedy_tokens
                             .fetch_add(active_rows, Ordering::Relaxed);
-                        match sample.mode {
+                        match mode {
                             sampling::BatchGreedyMode::CudaBf16NoPenalty => {
                                 self.stats
                                     .total_sampling_batch_greedy_cuda_plain_calls
@@ -2321,6 +2423,13 @@ impl InferenceEngine {
                 }
             }
 
+            next_input_ids_device =
+                if batch_greedy_tokens.is_some() && alive.iter().all(|&is_alive| is_alive) {
+                    batch_greedy_device_tokens
+                } else {
+                    None
+                };
+
             for p in positions.iter_mut() {
                 *p += 1;
             }
@@ -2359,14 +2468,9 @@ impl InferenceEngine {
         let mut extract_state_replace_us = 0u64;
         if rounds_done > 0 {
             let t_extract = Instant::now();
-            // Round 9 batched setup: gated behind env flag (default OFF) due to
-            // a known correctness regression — the cached BatchedKvExtract
-            // adoption produces garbled output after 1-2 batches in this bench
-            // workload (see /memories/session/round5_cuda_graph_state.md). When
-            // disabled, we still run the gather-extract kernels and materialize
-            // per-row into seq.kv_caches (Round 8 behavior).
-            let batched_setup_enabled =
-                env_flag_default("CRANE_PAGED_KV_BATCHED_SETUP", false);
+            // M2 batched setup: when enabled, publish the page-gathered batched
+            // KV form for the next setup; otherwise materialize per-row caches.
+            let batched_setup_enabled = env_flag_default("CRANE_PAGED_KV_BATCHED_SETUP", false);
             let paged_extract = match self.maybe_extract_paged_kv_gather(
                 &batch,
                 &kv_lens,
@@ -2416,38 +2520,37 @@ impl InferenceEngine {
                             }
                         }
                     }
-                    extract_state_replace_us =
-                        t_state_replace.elapsed().as_micros() as u64;
+                    extract_state_replace_us = t_state_replace.elapsed().as_micros() as u64;
                     self.recount_kv_bytes();
                 } else {
                     let t_clear = Instant::now();
-                self.model.clear_kv_cache();
-                extract_timings.cache_clear_us = t_clear.elapsed().as_micros() as u64;
-                let t_state_replace = Instant::now();
-                // Round 9: per-row materialization is gone. Clear seq.kv_caches
-                // for alive seqs and publish the batched form on the engine for
-                // the next setup_batch_decode to consume directly.
-                for (i, seq_id) in batch.iter().enumerate() {
-                    if alive[i] {
-                        if let Some(seq) = self.sequences.get_mut(seq_id) {
-                            seq.kv_caches = vec![None; self.num_layers];
-                        }
-                        let kv_token_len = self
-                            .sequences
-                            .get(seq_id)
-                            .map(|seq| seq.tokens.len().saturating_sub(1));
-                        if !native_append_synced_pages {
-                            if let Some(kv_token_len) = kv_token_len {
-                                self.sync_paged_kv_for_sequence(seq_id, kv_token_len);
+                    self.model.clear_kv_cache();
+                    extract_timings.cache_clear_us = t_clear.elapsed().as_micros() as u64;
+                    let t_state_replace = Instant::now();
+                    // Round 9: per-row materialization is gone. Clear seq.kv_caches
+                    // for alive seqs and publish the batched form on the engine for
+                    // the next setup_batch_decode to consume directly.
+                    for (i, seq_id) in batch.iter().enumerate() {
+                        if alive[i] {
+                            if let Some(seq) = self.sequences.get_mut(seq_id) {
+                                seq.kv_caches = vec![None; self.num_layers];
                             }
-                        } else if let Some(kv_token_len) = kv_token_len {
-                            debug_assert_eq!(kv_token_len, kv_lens[i] + rounds_done);
+                            let kv_token_len = self
+                                .sequences
+                                .get(seq_id)
+                                .map(|seq| seq.tokens.len().saturating_sub(1));
+                            if !native_append_synced_pages {
+                                if let Some(kv_token_len) = kv_token_len {
+                                    self.sync_paged_kv_for_sequence(seq_id, kv_token_len);
+                                }
+                            } else if let Some(kv_token_len) = kv_token_len {
+                                debug_assert_eq!(kv_token_len, kv_lens[i] + rounds_done);
+                            }
                         }
                     }
-                }
-                self.pending_batched_kv_extract = Some((batch.clone(), extracted));
-                extract_state_replace_us = t_state_replace.elapsed().as_micros() as u64;
-                self.recount_kv_bytes();
+                    self.pending_batched_kv_extract = Some((batch.clone(), extracted));
+                    extract_state_replace_us = t_state_replace.elapsed().as_micros() as u64;
+                    self.recount_kv_bytes();
                 }
             } else {
                 match self.model.extract_batch_kv_selective(
@@ -2639,7 +2742,10 @@ impl InferenceEngine {
                 continue;
             }
 
-            self.swap_in(seq_id);
+            if !self.swap_in(seq_id) {
+                self.send_error(seq_id, "KV swap-in failed");
+                continue;
+            }
 
             for _round in 0..self.decode_tokens_per_seq {
                 let (input_ids, start_pos) = {
@@ -2788,9 +2894,9 @@ impl InferenceEngine {
     //  KV cache management
     // ─────────────────────────────────────────────────────────
 
-    fn swap_in(&mut self, seq_id: &str) {
+    fn swap_in(&mut self, seq_id: &str) -> bool {
         if self.active_seq_id.as_deref() == Some(seq_id) {
-            return;
+            return true;
         }
 
         if !self.model.supports_kv_swap() {
@@ -2798,7 +2904,7 @@ impl InferenceEngine {
                 self.model.clear_kv_cache();
                 self.active_seq_id = Some(seq_id.to_string());
             }
-            return;
+            return true;
         }
 
         // Save previous active sequence's KV cache from the model.
@@ -2806,6 +2912,24 @@ impl InferenceEngine {
             let caches = self.model.get_kv_caches();
             if let Some(prev_seq) = self.sequences.get_mut(prev_id) {
                 prev_seq.kv_caches = caches;
+            }
+        }
+
+        let needs_paged_materialize = self.sequences.get(seq_id).is_some_and(|seq| {
+            !seq.kv_caches.iter().any(|cache| cache.is_some()) && seq.paged_kv.token_len() > 0
+        });
+        if needs_paged_materialize {
+            let batch = vec![seq_id.to_string()];
+            match self.materialize_paged_kv_rows_for_batch(&batch, &[0]) {
+                Ok(true) => {}
+                Ok(false) => {
+                    error!(id = %seq_id, "paged KV swap-in materialization was unavailable");
+                    return false;
+                }
+                Err(err) => {
+                    error!(id = %seq_id, error = %err, "paged KV swap-in materialization failed");
+                    return false;
+                }
             }
         }
 
@@ -2822,6 +2946,7 @@ impl InferenceEngine {
         self.stats
             .total_kv_swap_count
             .fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// Mark that the model finished processing `seq_id` for this scheduling

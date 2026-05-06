@@ -51,6 +51,7 @@ pub enum BatchGreedyMode {
 pub struct BatchGreedySample {
     pub tokens: Vec<u32>,
     pub mode: BatchGreedyMode,
+    pub device_tokens: Option<Tensor>,
 }
 
 #[cfg(feature = "cuda")]
@@ -346,9 +347,18 @@ pub fn sample_batch_greedy(
                 &mut buffers.batch_greedy_cuda_buffers,
             )
             .map_err(anyhow::Error::from)?;
+            let device_tokens = buffers
+                .batch_greedy_cuda_buffers
+                .output_tokens_tensor_from(logits, tokens.len())
+                .map(Some)
+                .unwrap_or_else(|err| {
+                    debug!(error = %err, "greedy CUDA tokens cannot be exposed as input_ids tensor");
+                    None
+                });
             return Ok(BatchGreedySample {
                 tokens,
                 mode: BatchGreedyMode::CudaBf16NoPenalty,
+                device_tokens,
             });
         }
 
@@ -397,9 +407,18 @@ pub fn sample_batch_greedy(
                     &mut buffers.batch_greedy_cuda_buffers,
                 ) {
                     Ok(tokens) => {
+                        let device_tokens = buffers
+                            .batch_greedy_cuda_buffers
+                            .output_tokens_tensor_from(logits, tokens.len())
+                            .map(Some)
+                            .unwrap_or_else(|err| {
+                                debug!(error = %err, "penalty greedy CUDA tokens cannot be exposed as input_ids tensor");
+                                None
+                            });
                         return Ok(BatchGreedySample {
                             tokens,
                             mode: BatchGreedyMode::CudaBf16Penalty,
+                            device_tokens,
                         });
                     }
                     Err(err) => {
@@ -431,6 +450,7 @@ pub fn sample_batch_greedy(
     Ok(BatchGreedySample {
         tokens: tokens.to_vec1::<u32>()?,
         mode: BatchGreedyMode::TensorFallback,
+        device_tokens: None,
     })
 }
 

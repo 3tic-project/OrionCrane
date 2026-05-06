@@ -8,6 +8,7 @@
 //! - `copy_from_slice_u32` — HtoD: create a new CUDA U32 tensor from a host slice
 //! - `copy_from_tensor_f32` — contiguous copy of a CUDA f32 tensor
 //! - `paged_kv_append_bf16` — append generated K/V into GPU page storage
+//! - `batch_kv_copy_ragged_bf16` — copy right-aligned ragged batch K/V into decode workspace
 //! - `paged_attention_decode_bf16_with_metadata` — decode-only paged attention
 //!
 //! Each operation eliminates multiple kernel launches and intermediate
@@ -107,6 +108,18 @@ mod fallback {
 
     pub fn copy_from_tensor_f32(src: &Tensor) -> Result<Tensor> {
         src.contiguous()
+    }
+
+    pub fn batch_kv_copy_ragged_bf16(
+        _dst_k: &Tensor,
+        _dst_v: &Tensor,
+        _src_k: &Tensor,
+        _src_v: &Tensor,
+        _kv_lens: &Tensor,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+    ) -> Result<()> {
+        candle_core::bail!("batch_kv_copy_ragged_bf16 requires the cuda feature")
     }
 
     #[derive(Default)]

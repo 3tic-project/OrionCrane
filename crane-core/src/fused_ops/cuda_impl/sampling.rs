@@ -9,7 +9,7 @@ use super::*;
 #[cfg(feature = "cuda")]
 #[derive(Default)]
 pub struct BatchGreedyCudaBuffers {
-    output_tokens: Option<CudaSlice<i32>>,
+    output_tokens: Option<CudaSlice<u32>>,
     recent_token_ids: Option<CudaSlice<u32>>,
     recent_lengths: Option<CudaSlice<u32>>,
     penalties: Option<CudaSlice<f32>>,
@@ -161,10 +161,31 @@ impl BatchGreedyCudaBuffers {
 
     fn ensure_output(&mut self, dev: &candle_core::CudaDevice, len: usize) -> Result<()> {
         if self.output_capacity < len {
-            self.output_tokens = Some(unsafe { dev.alloc::<i32>(len)? });
+            self.output_tokens = Some(unsafe { dev.alloc::<u32>(len)? });
             self.output_capacity = len;
         }
         Ok(())
+    }
+
+    pub fn output_tokens_tensor_from(&self, anchor: &Tensor, batch_size: usize) -> Result<Tensor> {
+        if batch_size == 0 {
+            candle_core::bail!("output_tokens_tensor_from requires non-empty batch")
+        }
+        let output_tokens = self
+            .output_tokens
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("missing output token buffer".into()))?;
+        if self.output_capacity < batch_size {
+            candle_core::bail!(
+                "output_tokens_tensor_from: buffer capacity {} < requested {}",
+                self.output_capacity,
+                batch_size
+            )
+        }
+        anchor.apply_op1_no_bwd(&BatchGreedyOutputTokensTensor {
+            output_tokens: output_tokens.clone(),
+            batch_size,
+        })
     }
 
     fn upload_recent_tokens(&mut self, dev: &candle_core::CudaDevice, src: &[u32]) -> Result<()> {
@@ -213,6 +234,32 @@ impl BatchGreedyCudaBuffers {
             dev.memcpy_htod(src, &mut dst)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+struct BatchGreedyOutputTokensTensor {
+    output_tokens: CudaSlice<u32>,
+    batch_size: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl candle_core::CustomOp1 for BatchGreedyOutputTokensTensor {
+    fn name(&self) -> &'static str {
+        "batch_greedy_output_tokens_tensor"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _storage: &candle_core::CpuStorage,
+        _layout: &Layout,
+    ) -> Result<(candle_core::CpuStorage, Shape)> {
+        candle_core::bail!("batch_greedy_output_tokens_tensor requires CUDA storage")
+    }
+
+    fn cuda_fwd(&self, storage: &CudaStorage, _layout: &Layout) -> Result<(CudaStorage, Shape)> {
+        let dst = CudaStorage::wrap_cuda_slice(self.output_tokens.clone(), storage.device.clone());
+        Ok((dst, Shape::from_dims(&[self.batch_size, 1])))
     }
 }
 
@@ -431,7 +478,7 @@ pub fn gpu_argmax_batch_readback(
     }
     let slice = output_tokens.slice(0..batch_size);
     let result = dev.clone_dtoh(&slice)?;
-    Ok(result.into_iter().map(|token| token as u32).collect())
+    Ok(result)
 }
 
 /// Batched BF16 greedy argmax with repetition penalty applied on CUDA before argmax.

@@ -987,6 +987,7 @@ pub struct PagedKvUpdate {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct PagedKvCompaction {
     pub live_pages: u64,
     pub moved_pages: u64,
@@ -1094,6 +1095,9 @@ impl PagedKvAllocator {
         dropped
     }
 
+    /// Metadata-only compaction helper. Runtime callers must preserve or
+    /// rebuild GPU page contents before treating compacted pages as resident.
+    #[allow(dead_code)]
     pub fn compact_sequences<'a, I>(&mut self, sequences: I) -> PagedKvCompaction
     where
         I: IntoIterator<Item = &'a mut PagedKvSequence>,

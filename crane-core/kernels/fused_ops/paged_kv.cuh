@@ -73,6 +73,41 @@ extern "C" __global__ void batch_kv_append_bf16_with_offset(
     }
 }
 
+extern "C" __global__ void batch_kv_copy_ragged_bf16(
+    __nv_bfloat16       *__restrict__ dst_k,
+    __nv_bfloat16       *__restrict__ dst_v,
+    const __nv_bfloat16 *__restrict__ src_k,
+    const __nv_bfloat16 *__restrict__ src_v,
+    const uint32_t      *__restrict__ kv_lens,
+    const int batch_size,
+    const int src_width,
+    const int dst_width,
+    const int num_kv_heads,
+    const int head_dim
+) {
+    const int row = blockIdx.x;
+    const int token = blockIdx.y;
+    if (row >= batch_size || token >= src_width) return;
+
+    const int kv_len = (int)kv_lens[row];
+    if (kv_len <= 0 || kv_len > src_width) return;
+    const int offset = src_width - kv_len;
+    if (token < offset) return;
+
+    const int token_width = num_kv_heads * head_dim;
+    const int64_t src_row_base = (int64_t)row * num_kv_heads * src_width * head_dim;
+    const int64_t dst_row_base = (int64_t)row * num_kv_heads * dst_width * head_dim;
+
+    for (int idx = threadIdx.x; idx < token_width; idx += blockDim.x) {
+        const int head = idx / head_dim;
+        const int dim = idx - head * head_dim;
+        const int64_t src = src_row_base + (int64_t)head * src_width * head_dim + (int64_t)token * head_dim + dim;
+        const int64_t dst = dst_row_base + (int64_t)head * dst_width * head_dim + (int64_t)token * head_dim + dim;
+        dst_k[dst] = src_k[src];
+        dst_v[dst] = src_v[src];
+    }
+}
+
 extern "C" __global__ void paged_kv_gather_bf16(
     const __nv_bfloat16 *__restrict__ pages,
     __nv_bfloat16       *__restrict__ output,

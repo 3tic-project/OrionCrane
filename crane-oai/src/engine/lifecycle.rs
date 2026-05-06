@@ -97,6 +97,15 @@ impl InferenceEngine {
     }
 
     pub(super) fn cleanup_sequence(&mut self, seq_id: &str) {
+        let cleared_pending_extract = self
+            .pending_batched_kv_extract
+            .as_ref()
+            .map(|(batch, _)| batch.iter().any(|id| id == seq_id))
+            .unwrap_or(false);
+        if cleared_pending_extract {
+            self.pending_batched_kv_extract = None;
+        }
+
         let freed = if self.active_seq_id.as_deref() == Some(seq_id) {
             self.model.active_kv_cache_bytes()
         } else if let Some(seq) = self.sequences.get(seq_id) {
@@ -118,6 +127,13 @@ impl InferenceEngine {
             self.active_seq_id = None;
         }
         self.model.clear_kv_cache();
+
+        if self.sequences.is_empty()
+            && self.scheduler.running.is_empty()
+            && self.scheduler.waiting.is_empty()
+        {
+            self.clear_idle_request_cache_state();
+        }
 
         if self.scheduler.effective_max_running.is_some() && self.scheduler.waiting.is_empty() {
             debug!("Eviction cap lifted (no waiting sequences, load subsided)");
@@ -144,5 +160,27 @@ impl InferenceEngine {
         }
 
         debug!(id = %seq_id, "Sequence cleaned up");
+    }
+
+    fn clear_idle_request_cache_state(&mut self) {
+        self.pending_batched_kv_extract = None;
+        self.model.clear_kv_cache();
+        let released_workspace_layers = self.model.release_batch_decode_workspaces();
+
+        #[cfg(feature = "cuda")]
+        {
+            self.cuda_graph_decode_entries.clear();
+            self.cuda_graph_decode_poisoned.clear();
+            self.cuda_graph_workspace_generation = self.model.batch_decode_workspace_generation();
+            self.cuda_graph_input_ids.clear();
+            self.cuda_graph_position_ids.clear();
+            self.cuda_graph_append_offset.clear();
+            self.cuda_graph_mask.clear();
+        }
+
+        debug!(
+            released_workspace_layers,
+            "cleared idle request-local KV workspace state"
+        );
     }
 }

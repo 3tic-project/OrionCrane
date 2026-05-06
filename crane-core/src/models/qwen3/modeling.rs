@@ -41,6 +41,9 @@ pub struct BatchDecodeSetupStats {
     pub contiguous_us: u64,
     pub extra_room_alloc_us: u64,
     pub cache_assign_us: u64,
+    pub batched_equal_length_layers: u64,
+    pub batched_ragged_layers: u64,
+    pub batched_ragged_rows: u64,
     pub total_us: u64,
     pub layers: usize,
     pub sequences: usize,
@@ -1081,6 +1084,7 @@ pub struct Qwen3Model {
     last_batch_decode_setup_stats: BatchDecodeSetupStats,
     last_batch_decode_extract_stats: BatchDecodeExtractStats,
     batch_decode_kv_workspaces: Vec<Option<BatchDecodeKvWorkspace>>,
+    batch_decode_kv_lens_buffer: crate::fused_ops::ReusableU32TensorBuffer,
     batch_decode_workspace_generation: u64,
 }
 
@@ -1162,6 +1166,7 @@ impl Qwen3Model {
             batch_decode_kv_workspaces: std::iter::repeat_with(|| None)
                 .take(config.num_hidden_layers)
                 .collect(),
+            batch_decode_kv_lens_buffer: crate::fused_ops::ReusableU32TensorBuffer::new(),
             batch_decode_workspace_generation: 0,
         })
     }
@@ -1278,6 +1283,7 @@ impl Qwen3Model {
             batch_decode_kv_workspaces: std::iter::repeat_with(|| None)
                 .take(num_hidden_layers)
                 .collect(),
+            batch_decode_kv_lens_buffer: crate::fused_ops::ReusableU32TensorBuffer::new(),
             batch_decode_workspace_generation: 0,
         })
     }
@@ -1353,6 +1359,21 @@ impl Qwen3Model {
             layer.clear_kv_cache();
         }
         self.paged_attention_metadata.release();
+    }
+
+    pub fn release_batch_decode_workspaces(&mut self) -> usize {
+        let mut released_layers = 0usize;
+        for slot in self.batch_decode_kv_workspaces.iter_mut() {
+            if slot.take().is_some() {
+                released_layers += 1;
+            }
+        }
+        self.batch_decode_kv_lens_buffer.clear();
+        if released_layers > 0 {
+            self.batch_decode_workspace_generation =
+                self.batch_decode_workspace_generation.wrapping_add(1);
+        }
+        released_layers
     }
 
     pub fn num_layers(&self) -> usize {
@@ -1527,13 +1548,13 @@ impl Qwen3Model {
     }
 
     /// Round 9 fast path: adopt a per-layer batched gather output as the KV
-    /// workspace contents. Avoids the per-row `narrow + contiguous + slice_set`
-    /// loop in [`setup_batch_decode`]; instead does ONE `slice_set` per layer
-    /// per K/V plane (`2 * num_layers` launches total).
+    /// workspace contents. Equal-length rows use one direct copy per layer;
+    /// CUDA BF16 ragged rows use a fused right-aligned copy kernel and other
+    /// devices keep the defensive rowwise path.
     ///
     /// `per_layer` is `[layer]([batch, kv_heads, max_total_len, head_dim] K, ...V)`,
     /// right-aligned per-row inside `max_total_len`. `kv_lens` is the per-row
-    /// total token count (each row's actual length within `max_total_len`).
+    /// total token count.
     pub fn setup_batch_decode_batched(
         &mut self,
         per_layer: &[Option<(Tensor, Tensor)>],
@@ -1572,6 +1593,26 @@ impl Qwen3Model {
 
         let batch = kv_lens.len();
         let requested_width = max_total_len + extra_room;
+        let ragged_kv_lens_tensor = if self.dtype == DType::BF16
+            && device.is_cuda()
+            && env_flag_default("CRANE_BATCH_KV_RAGGED_COPY", true)
+            && kv_lens.iter().any(|&len| len != max_total_len)
+        {
+            let mut kv_lens_u32 = Vec::with_capacity(kv_lens.len());
+            for &len in kv_lens {
+                kv_lens_u32.push(u32::try_from(len).map_err(|_| {
+                    candle_core::Error::Msg(format!(
+                        "KV length {len} exceeds u32 range for CUDA ragged setup"
+                    ))
+                })?);
+            }
+            Some(
+                self.batch_decode_kv_lens_buffer
+                    .upload_1d(&kv_lens_u32, &device)?,
+            )
+        } else {
+            None
+        };
         for layer_idx in 0..self.layers.len() {
             let Some((layer_k, layer_v)) = per_layer[layer_idx].as_ref() else {
                 let layer = &mut self.layers[layer_idx];
@@ -1579,6 +1620,28 @@ impl Qwen3Model {
                 layer.self_attn.cache_seq_len = 0;
                 continue;
             };
+            let (source_batch, source_heads, source_width, source_head_dim) = layer_k.dims4()?;
+            if layer_v.dims() != layer_k.dims() {
+                candle_core::bail!("batched setup layer {layer_idx} K/V shapes differ")
+            }
+            if source_batch != batch
+                || source_heads != kv_heads
+                || source_width != max_total_len
+                || source_head_dim != head_dim
+            {
+                candle_core::bail!(
+                    "batched setup layer {layer_idx} shape {:?} does not match [{batch}, {kv_heads}, {max_total_len}, {head_dim}]",
+                    layer_k.dims()
+                )
+            }
+            for (row, &kv_len) in kv_lens.iter().enumerate() {
+                if kv_len > max_total_len {
+                    candle_core::bail!(
+                        "row {row} KV length {kv_len} exceeds batched width {max_total_len}"
+                    )
+                }
+            }
+
             let (buf_k, buf_v) = self.ensure_batch_decode_kv_workspace(
                 layer_idx,
                 batch,
@@ -1591,11 +1654,46 @@ impl Qwen3Model {
             )?;
 
             let t_pad_stack = Instant::now();
-            // ONE slice_set per layer per K/V plane — replaces the per-row
-            // `narrow + contiguous + slice_set` loop. Source is the contiguous
-            // gather output; destination is the workspace prefix `[0, max_total_len)`.
-            buf_k.slice_set(layer_k, 2, 0)?;
-            buf_v.slice_set(layer_v, 2, 0)?;
+            if kv_lens.iter().all(|&len| len == max_total_len) {
+                stats.batched_equal_length_layers += 1;
+                buf_k.slice_set(layer_k, 2, 0)?;
+                buf_v.slice_set(layer_v, 2, 0)?;
+            } else {
+                stats.batched_ragged_layers += 1;
+                if let Some(kv_lens_tensor) = ragged_kv_lens_tensor.as_ref() {
+                    stats.batched_ragged_rows +=
+                        kv_lens.iter().filter(|&&len| len > 0).count() as u64;
+                    crate::fused_ops::batch_kv_copy_ragged_bf16(
+                        &buf_k,
+                        &buf_v,
+                        layer_k,
+                        layer_v,
+                        kv_lens_tensor,
+                        kv_heads,
+                        head_dim,
+                    )?;
+                } else {
+                    for (row, &kv_len) in kv_lens.iter().enumerate() {
+                        if kv_len == 0 {
+                            continue;
+                        }
+                        stats.batched_ragged_rows += 1;
+                        let offset = max_total_len - kv_len;
+                        let src_k = layer_k
+                            .narrow(0, row, 1)?
+                            .narrow(2, offset, kv_len)?
+                            .contiguous()?;
+                        let src_v = layer_v
+                            .narrow(0, row, 1)?
+                            .narrow(2, offset, kv_len)?
+                            .contiguous()?;
+                        let dst_k = buf_k.narrow(0, row, 1)?;
+                        let dst_v = buf_v.narrow(0, row, 1)?;
+                        dst_k.slice_set(&src_k, 2, offset)?;
+                        dst_v.slice_set(&src_v, 2, offset)?;
+                    }
+                }
+            }
             stats.pad_stack_us += elapsed_us(t_pad_stack);
 
             let t_assign = Instant::now();
