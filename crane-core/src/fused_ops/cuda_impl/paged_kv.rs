@@ -22,6 +22,10 @@ pub struct PagedAttentionMetadataCudaBuffers {
     indices_len: usize,
     batch_capacity: usize,
     batch_size: usize,
+    cached_indptr: Vec<u32>,
+    cached_indices: Vec<u32>,
+    cached_last_page_lens: Vec<u32>,
+    cached_seq_lens: Vec<u32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -44,6 +48,10 @@ impl PagedAttentionMetadataCudaBuffers {
         self.indices_len = 0;
         self.batch_capacity = 0;
         self.batch_size = 0;
+        self.cached_indptr.clear();
+        self.cached_indices.clear();
+        self.cached_last_page_lens.clear();
+        self.cached_seq_lens.clear();
     }
 
     pub fn upload(
@@ -84,14 +92,20 @@ impl PagedAttentionMetadataCudaBuffers {
             self.batch_capacity = batch_size;
         }
 
-        let mut indptr_dst = self
-            .indptr
-            .as_mut()
-            .ok_or_else(|| candle_core::Error::Msg("missing paged attention indptr buffer".into()))?
-            .slice_mut(0..indptr.len());
-        dev.memcpy_htod(indptr, &mut indptr_dst)?;
+        if self.cached_indptr.as_slice() != indptr {
+            let mut indptr_dst = self
+                .indptr
+                .as_mut()
+                .ok_or_else(|| {
+                    candle_core::Error::Msg("missing paged attention indptr buffer".into())
+                })?
+                .slice_mut(0..indptr.len());
+            dev.memcpy_htod(indptr, &mut indptr_dst)?;
+            self.cached_indptr.clear();
+            self.cached_indptr.extend_from_slice(indptr);
+        }
 
-        if !indices.is_empty() {
+        if !indices.is_empty() && self.cached_indices.as_slice() != indices {
             let mut indices_dst = self
                 .indices
                 .as_mut()
@@ -100,24 +114,34 @@ impl PagedAttentionMetadataCudaBuffers {
                 })?
                 .slice_mut(0..indices.len());
             dev.memcpy_htod(indices, &mut indices_dst)?;
+            self.cached_indices.clear();
+            self.cached_indices.extend_from_slice(indices);
         }
 
-        let mut last_page_lens_dst = self
-            .last_page_lens
-            .as_mut()
-            .ok_or_else(|| {
-                candle_core::Error::Msg("missing paged attention last-page-lens buffer".into())
-            })?
-            .slice_mut(0..batch_size);
-        let mut seq_lens_dst = self
-            .seq_lens
-            .as_mut()
-            .ok_or_else(|| {
-                candle_core::Error::Msg("missing paged attention seq-lens buffer".into())
-            })?
-            .slice_mut(0..batch_size);
-        dev.memcpy_htod(last_page_lens, &mut last_page_lens_dst)?;
-        dev.memcpy_htod(seq_lens, &mut seq_lens_dst)?;
+        if self.cached_last_page_lens.as_slice() != last_page_lens {
+            let mut last_page_lens_dst = self
+                .last_page_lens
+                .as_mut()
+                .ok_or_else(|| {
+                    candle_core::Error::Msg("missing paged attention last-page-lens buffer".into())
+                })?
+                .slice_mut(0..batch_size);
+            dev.memcpy_htod(last_page_lens, &mut last_page_lens_dst)?;
+            self.cached_last_page_lens.clear();
+            self.cached_last_page_lens.extend_from_slice(last_page_lens);
+        }
+        if self.cached_seq_lens.as_slice() != seq_lens {
+            let mut seq_lens_dst = self
+                .seq_lens
+                .as_mut()
+                .ok_or_else(|| {
+                    candle_core::Error::Msg("missing paged attention seq-lens buffer".into())
+                })?
+                .slice_mut(0..batch_size);
+            dev.memcpy_htod(seq_lens, &mut seq_lens_dst)?;
+            self.cached_seq_lens.clear();
+            self.cached_seq_lens.extend_from_slice(seq_lens);
+        }
         Ok(())
     }
 }
