@@ -90,10 +90,21 @@ def select_lines(start: int, count: int) -> list[str]:
     return [CORPUS[(start + offset) % len(CORPUS)] for offset in range(count)]
 
 
-def build_prompt(request_id: int, batch_lines: int, mode: str) -> str:
+def build_glossary(repeat: int) -> str:
+    if repeat <= 1:
+        return GLOSSARY
+    entries = ("姉→姐姐", "旧校舎→旧校舍", "時計塔→钟楼", "理科準備室→理科准备室")
+    return "术语表：\n" + "".join(
+        f"{source}{index}→{target}{index}\n"
+        for index in range(repeat)
+        for source, target in (entry.split("→", 1) for entry in entries)
+    )
+
+
+def build_prompt(request_id: int, batch_lines: int, mode: str, glossary_repeat: int) -> str:
     texts = select_lines(request_id * 7, batch_lines)
     context = select_lines(request_id * 7 - 10, 10) if "context" in mode else []
-    glossary = GLOSSARY if "glossary" in mode else None
+    glossary = build_glossary(glossary_repeat) if "glossary" in mode else None
     parts: list[str] = []
     if context:
         parts.extend(("\n".join(context), "\n\n"))
@@ -115,10 +126,12 @@ def build_prompt(request_id: int, batch_lines: int, mode: str) -> str:
     return "".join(parts)
 
 
-def estimate_max_tokens(request_id: int, batch_lines: int, mode: str) -> int:
+def estimate_max_tokens(
+    request_id: int, batch_lines: int, mode: str, glossary_repeat: int
+) -> int:
     texts = select_lines(request_id * 7, batch_lines)
     context = select_lines(request_id * 7 - 10, 10) if "context" in mode else []
-    glossary_chars = len(GLOSSARY) if "glossary" in mode else 0
+    glossary_chars = len(build_glossary(glossary_repeat)) if "glossary" in mode else 0
     source_budget = sum(len(text) for text in texts) * 2
     structure_budget = batch_lines * 48 + 512
     context_margin = min(sum(len(text) for text in context) // 4, 1_500)
@@ -152,7 +165,9 @@ def parse_jsonl_count(content: str) -> int:
 
 
 def send_request(args: argparse.Namespace, request_id: int) -> RequestResult:
-    prompt = build_prompt(request_id, args.batch_lines, args.prompt_mode)
+    prompt = build_prompt(
+        request_id, args.batch_lines, args.prompt_mode, args.glossary_repeat
+    )
     payload = {
         "model": args.model,
         "messages": [{"role": "user", "content": prompt}],
@@ -160,7 +175,9 @@ def send_request(args: argparse.Namespace, request_id: int) -> RequestResult:
         "top_p": args.top_p,
         "top_k": args.top_k,
         "max_tokens": args.max_tokens
-        or estimate_max_tokens(request_id, args.batch_lines, args.prompt_mode),
+        or estimate_max_tokens(
+            request_id, args.batch_lines, args.prompt_mode, args.glossary_repeat
+        ),
         "stream": False,
     }
     request = urllib.request.Request(
@@ -221,6 +238,12 @@ def main() -> int:
     parser.add_argument("--concurrency", type=int, default=32)
     parser.add_argument("--batch-lines", type=int, default=15)
     parser.add_argument(
+        "--glossary-repeat",
+        type=int,
+        default=1,
+        help="repeat the small fixture glossary to exercise long shared-prefix caching",
+    )
+    parser.add_argument(
         "--prompt-mode",
         choices=("plain", "glossary", "context", "context-glossary"),
         default="context-glossary",
@@ -232,8 +255,13 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--output", type=pathlib.Path)
     args = parser.parse_args()
-    if args.requests <= 0 or args.concurrency <= 0 or args.batch_lines <= 0:
-        parser.error("requests, concurrency, and batch-lines must be positive")
+    if (
+        args.requests <= 0
+        or args.concurrency <= 0
+        or args.batch_lines <= 0
+        or args.glossary_repeat <= 0
+    ):
+        parser.error("requests, concurrency, batch-lines, and glossary-repeat must be positive")
     if args.warmup_requests:
         warmup = run_round(args, args.warmup_requests, 10_000)
         errors = [result.error for result in warmup if result.error]

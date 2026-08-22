@@ -187,6 +187,7 @@ CUDA 版本默认启用空闲显存整理：当 engine 完全空闲 `120s` 后�
 - `CRANE_PAGED_KV_NATIVE_APPEND`，默认开启（CUDA BF16）
 - `CRANE_PAGED_KV_GATHER_EXTRACT`，默认开启（CUDA BF16）
 - `CRANE_PAGED_KV_BATCHED_SETUP`，默认开启，使用已验证的 page-gathered batched KV setup
+- `CRANE_PREFIX_CACHE`，默认开启；只有排队请求实际共享至少 256 token 前缀时才分配缓存
 - `CRANE_PAGED_KV_ATTENTION`，默认关闭，仅建议分析性能时手动开启
 - `CRANE_CUDA_GRAPH_DECODE` 系列开关，默认关闭
 - `CRANE_DISABLE_GPU_MEM_HARD_CHECK`，默认开启以避免共享 GPU 上 `cuMemGetInfo` 误触发抢占；需要严格执行 `--gpu-memory-limit` 时设为 `0`
@@ -214,4 +215,4 @@ CUDA 版本默认启用空闲显存整理：当 engine 完全空闲 `120s` 后�
 benchmarks/run_oriontranslator_bench.sh
 ```
 
-可通过 `MAX_CONCURRENT`、`CONCURRENCY`、`REQUESTS`、`PROMPT_MODE` 等环境变量做单变量 A/B；额外的客户端参数可直接追加在命令末尾。结果与服务日志写入本地 `outputs/`，不会进入 Git。
+可通过 `MAX_CONCURRENT`、`CONCURRENCY`、`REQUESTS`、`PROMPT_MODE` 等环境变量做单变量 A/B；额外的客户端参数可直接追加在命令末尾。`--glossary-repeat 16` 可构造长共享术语表，用于验证 prefix-KV cache。结果与服务日志写入本地 `outputs/`，不会进入 Git。

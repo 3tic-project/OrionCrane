@@ -724,6 +724,7 @@ mod tests {
             status: SequenceStatus::Running,
             created_at: Instant::now(),
             prompt_len: tokens.len(),
+            prefill_cached_tokens: 0,
             tokens,
             kv_caches: vec![],
             paged_kv: crate::engine::paged_kv::PagedKvSequence::default(),

@@ -22,6 +22,14 @@ pub struct EngineStats {
     pub total_prefill_forward_time_us: AtomicU64,
     pub total_prefill_sampling_time_us: AtomicU64,
     pub total_prefill_swap_time_us: AtomicU64,
+    pub total_prefix_cache_lookups: AtomicU64,
+    pub total_prefix_cache_hits: AtomicU64,
+    pub total_prefix_cache_hit_tokens: AtomicU64,
+    pub total_prefix_cache_inserts: AtomicU64,
+    pub total_prefix_cache_insert_tokens: AtomicU64,
+    pub total_prefix_cache_insert_time_us: AtomicU64,
+    pub prefix_cache_entries: AtomicU64,
+    pub prefix_cache_bytes: AtomicU64,
     pub total_batch_decode_calls: AtomicU64,
     pub total_batch_decode_tokens: AtomicU64,
     pub total_batch_decode_time_us: AtomicU64,
@@ -171,6 +179,14 @@ impl EngineStats {
             total_prefill_forward_time_us: AtomicU64::new(0),
             total_prefill_sampling_time_us: AtomicU64::new(0),
             total_prefill_swap_time_us: AtomicU64::new(0),
+            total_prefix_cache_lookups: AtomicU64::new(0),
+            total_prefix_cache_hits: AtomicU64::new(0),
+            total_prefix_cache_hit_tokens: AtomicU64::new(0),
+            total_prefix_cache_inserts: AtomicU64::new(0),
+            total_prefix_cache_insert_tokens: AtomicU64::new(0),
+            total_prefix_cache_insert_time_us: AtomicU64::new(0),
+            prefix_cache_entries: AtomicU64::new(0),
+            prefix_cache_bytes: AtomicU64::new(0),
             total_batch_decode_calls: AtomicU64::new(0),
             total_batch_decode_tokens: AtomicU64::new(0),
             total_batch_decode_time_us: AtomicU64::new(0),
@@ -399,6 +415,20 @@ impl EngineStats {
             total_prefill_forward_time_us: total_prefill_forward_us,
             total_prefill_sampling_time_us: total_prefill_sampling_us,
             total_prefill_swap_time_us: total_prefill_swap_us,
+            total_prefix_cache_lookups: self.total_prefix_cache_lookups.load(Ordering::Relaxed),
+            total_prefix_cache_hits: self.total_prefix_cache_hits.load(Ordering::Relaxed),
+            total_prefix_cache_hit_tokens: self
+                .total_prefix_cache_hit_tokens
+                .load(Ordering::Relaxed),
+            total_prefix_cache_inserts: self.total_prefix_cache_inserts.load(Ordering::Relaxed),
+            total_prefix_cache_insert_tokens: self
+                .total_prefix_cache_insert_tokens
+                .load(Ordering::Relaxed),
+            total_prefix_cache_insert_time_us: self
+                .total_prefix_cache_insert_time_us
+                .load(Ordering::Relaxed),
+            prefix_cache_entries: self.prefix_cache_entries.load(Ordering::Relaxed),
+            prefix_cache_bytes: self.prefix_cache_bytes.load(Ordering::Relaxed),
             avg_queue_wait_ms: avg_ms(total_queue_wait_us, total_prefill_steps),
             avg_time_to_first_token_ms: avg_ms(total_ttft_us, total_prefill_steps),
             avg_prefill_step_ms: avg_ms(total_prefill_us, total_prefill_steps),
@@ -721,6 +751,14 @@ pub struct StatsSnapshot {
     pub total_prefill_forward_time_us: u64,
     pub total_prefill_sampling_time_us: u64,
     pub total_prefill_swap_time_us: u64,
+    pub total_prefix_cache_lookups: u64,
+    pub total_prefix_cache_hits: u64,
+    pub total_prefix_cache_hit_tokens: u64,
+    pub total_prefix_cache_inserts: u64,
+    pub total_prefix_cache_insert_tokens: u64,
+    pub total_prefix_cache_insert_time_us: u64,
+    pub prefix_cache_entries: u64,
+    pub prefix_cache_bytes: u64,
     pub avg_queue_wait_ms: f64,
     pub avg_time_to_first_token_ms: f64,
     pub avg_prefill_step_ms: f64,
@@ -875,6 +913,8 @@ mod tests {
         assert_eq!(s.active_sequences.load(Ordering::Relaxed), 0);
         assert_eq!(s.waiting_sequences.load(Ordering::Relaxed), 0);
         assert_eq!(s.total_prefill_steps.load(Ordering::Relaxed), 0);
+        assert_eq!(s.total_prefix_cache_hits.load(Ordering::Relaxed), 0);
+        assert_eq!(s.prefix_cache_bytes.load(Ordering::Relaxed), 0);
         assert_eq!(s.total_batch_decode_calls.load(Ordering::Relaxed), 0);
         assert_eq!(
             s.total_batch_decode_setup_pad_stack_time_us
@@ -959,6 +999,12 @@ mod tests {
         s.active_sequences.store(4, Ordering::Relaxed);
         s.waiting_sequences.store(2, Ordering::Relaxed);
         s.total_prefill_steps.store(5, Ordering::Relaxed);
+        s.total_prefix_cache_lookups.store(9, Ordering::Relaxed);
+        s.total_prefix_cache_hits.store(7, Ordering::Relaxed);
+        s.total_prefix_cache_hit_tokens
+            .store(1792, Ordering::Relaxed);
+        s.prefix_cache_entries.store(2, Ordering::Relaxed);
+        s.prefix_cache_bytes.store(4096, Ordering::Relaxed);
         s.total_queue_wait_time_us.store(50_000, Ordering::Relaxed);
         s.total_time_to_first_token_us
             .store(150_000, Ordering::Relaxed);
@@ -1193,6 +1239,11 @@ mod tests {
         assert_eq!(snap.paged_kv_total_reused_pages, 24);
         assert_eq!(snap.paged_kv_total_freed_pages, 25);
         assert_eq!(snap.tracked_kv_cache_bytes, 1024);
+        assert_eq!(snap.total_prefix_cache_lookups, 9);
+        assert_eq!(snap.total_prefix_cache_hits, 7);
+        assert_eq!(snap.total_prefix_cache_hit_tokens, 1792);
+        assert_eq!(snap.prefix_cache_entries, 2);
+        assert_eq!(snap.prefix_cache_bytes, 4096);
         assert!((snap.avg_queue_wait_ms - 10.0).abs() < 0.01);
         assert!((snap.avg_time_to_first_token_ms - 30.0).abs() < 0.01);
         assert!((snap.avg_batch_decode_setup_pad_stack_ms - 10.0).abs() < 0.01);

@@ -88,6 +88,7 @@ materially affects throughput:
 | `CRANE_PAGED_KV_ATTENTION` | **off** | Current paged attention kernel regresses on short/medium contexts; eager GQA wins. |
 | `CRANE_PAGED_KV_BATCHED_SETUP` | **on** | Use the validated page-gathered batched KV setup path by default; set `0` to return to per-row materialization for A/B checks. |
 | `CRANE_BATCH_KV_RAGGED_COPY` | **on** (CUDA BF16) | Uses one fused BF16 kernel per layer for ragged batched-setup workspace copies. |
+| `CRANE_PREFIX_CACHE` | **on** | Admission-controlled prefix KV reuse; allocates only after a live prompt shares at least 256 tokens. |
 | `CRANE_CUDA_GRAPH_DECODE` | **off** | Eager forward is at parity or ~1% faster on the validated workload. |
 | `CRANE_CUDA_GRAPH_DECODE_CAPTURE` | **off** | Requires the master switch; opt-in only. |
 | `CRANE_CUDA_GRAPH_DECODE_WIDTH_BUCKET` | **on** | Safe with capture off; ~6–10% lift when capture is on. Leave on. |
@@ -153,6 +154,10 @@ curl http://localhost:8000/v1/chat/completions \
 | `CRANE_PROFILE` | off | Emit per-stage structured timing logs for short profiling runs. |
 | `CRANE_PAGED_KV_BATCHED_SETUP` | **on** | Publishes page-gathered batched KV for the next setup. Set `0` to materialize per-row caches after extract for legacy A/B checks. |
 | `CRANE_BATCH_KV_RAGGED_COPY` | on for CUDA BF16 | Replaces `narrow + contiguous + slice_set` loops in ragged batched setup with a right-aligned BF16 copy kernel. Set `0` only for profiling the legacy rowwise path. |
+| `CRANE_PREFIX_CACHE` | on | Cache immutable prompt-prefix KV only after another live request proves the prefix is reusable. |
+| `CRANE_PREFIX_CACHE_MIN_TOKENS` | `256` | Minimum shared prefix. The conservative default avoids losing time on short chat-template/glossary prefixes. |
+| `CRANE_PREFIX_CACHE_MAX_ENTRIES` | `4` | LRU entry cap. |
+| `CRANE_PREFIX_CACHE_MAX_MB` | `256` | Requested persistent prefix-KV budget. The effective cap is the smaller of this value and one quarter of the request-KV budget on memory-limited deployments. |
 | `CRANE_IDLE_CUDA_MEM_TRIM_SECS` | `120` | When no requests are active, wait this many seconds, clear request-local workspaces, synchronize CUDA, and trim the CUDA async memory pool. This returns idle pool reservations but keeps model weights/context resident; `0` disables it. |
 
 ## CUDA Graph Flags (advanced, opt-in)

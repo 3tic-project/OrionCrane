@@ -36,6 +36,7 @@ mod lifecycle;
 pub mod model_factory;
 pub mod paged_kv;
 mod paged_kv_runtime;
+mod prefix_cache;
 pub mod sampling;
 pub mod scheduler;
 pub mod sequence;
@@ -58,6 +59,7 @@ use tracing::{debug, error, info, warn};
 use backend::{BatchDecodeExtractTimings, ModelBackend};
 use crane_core::utils::token_output_stream::TokenOutputStream;
 use paged_kv::{PagedKvAllocator, PagedKvGpuPageStore, DEFAULT_BLOCK_SIZE};
+use prefix_cache::PrefixCache;
 use sampling::SamplingBuffers;
 use scheduler::{Scheduler, SchedulerOutput};
 use sequence::{Sequence, SequenceStatus};
@@ -305,6 +307,9 @@ pub struct InferenceEngine {
     step_counter: u64,
     sampling_buffers: SamplingBuffers,
     paged_kv_allocator: PagedKvAllocator,
+    /// Immutable prompt-prefix KV entries admitted only after observing an
+    /// actual queued-prefix match.
+    prefix_cache: PrefixCache,
     /// Memory configuration for VRAM limits.
     memory_config: MemoryConfig,
     /// When fully idle for this long, trim CUDA's async memory pool back to the driver.
@@ -421,6 +426,26 @@ impl InferenceEngine {
             }
         });
         let paged_kv_allocator = PagedKvAllocator::new(paged_kv_block_size, paged_kv_layout);
+        let requested_prefix_cache_bytes =
+            (env_usize("CRANE_PREFIX_CACHE_MAX_MB", 256) as u64) << 20;
+        // Persistent prefix KV should never consume more than a quarter of
+        // the request-KV budget on smaller cards. With no configured GPU
+        // limit, retain the conservative fixed 256 MiB cap.
+        let prefix_cache_max_bytes = if memory_config.gpu_memory_limit_bytes > 0 {
+            let request_kv_budget = memory_config
+                .gpu_memory_limit_bytes
+                .saturating_sub(memory_config.baseline_gpu_bytes)
+                / KV_GPU_OVERHEAD_FACTOR;
+            requested_prefix_cache_bytes.min(request_kv_budget / 4)
+        } else {
+            requested_prefix_cache_bytes
+        };
+        let prefix_cache = PrefixCache::new(
+            env_flag_default("CRANE_PREFIX_CACHE", true),
+            env_usize("CRANE_PREFIX_CACHE_MIN_TOKENS", 256),
+            env_usize("CRANE_PREFIX_CACHE_MAX_ENTRIES", 4),
+            prefix_cache_max_bytes,
+        );
         let paged_kv_shadow_validate = env_flag("CRANE_PAGED_KV_SHADOW_VALIDATE");
         let paged_kv_shadow_max_layers = env_usize("CRANE_PAGED_KV_SHADOW_MAX_LAYERS", num_layers)
             .min(num_layers)
@@ -477,6 +502,7 @@ impl InferenceEngine {
             step_counter: 0,
             sampling_buffers: SamplingBuffers::new(),
             paged_kv_allocator,
+            prefix_cache,
             memory_config,
             idle_cuda_mem_trim_after: env_duration_secs("CRANE_IDLE_CUDA_MEM_TRIM_SECS", 120),
             last_mem_warn: Instant::now() - std::time::Duration::from_secs(60),
@@ -526,6 +552,14 @@ impl InferenceEngine {
                 gather_extract = engine.paged_kv_gather_extract,
                 paged_attention = engine.paged_kv_attention,
                 "CRANE_PAGED_KV_NATIVE_APPEND enabled; batch past K/V and generated K/V will be copied into GPU pages before fallback extraction"
+            );
+        }
+        if engine.prefix_cache.enabled() {
+            info!(
+                min_tokens = engine.prefix_cache.min_tokens(),
+                max_entries = engine.prefix_cache.max_entries(),
+                max_bytes = engine.prefix_cache.max_bytes(),
+                "admission-controlled prompt prefix cache enabled"
             );
         }
         if paged_kv_attention {
@@ -997,13 +1031,16 @@ impl InferenceEngine {
         }
 
         // Check 1: tracked KV bytes vs overhead-adjusted budget.
-        if self.tracked_kv_bytes > budget {
+        let accounted_kv_bytes = self
+            .tracked_kv_bytes
+            .saturating_add(self.prefix_cache.used_bytes());
+        if accounted_kv_bytes > budget {
             let now = Instant::now();
             if now.duration_since(self.last_mem_warn).as_secs() >= 5 {
                 self.last_mem_warn = now;
                 warn!(
                     "KV budget exceeded: kv_used={} > kv_budget={} (limit={} baseline={} overhead={}x)",
-                    format_bytes_engine(self.tracked_kv_bytes),
+                    format_bytes_engine(accounted_kv_bytes),
                     format_bytes_engine(budget),
                     format_bytes_engine(limit),
                     format_bytes_engine(self.memory_config.baseline_gpu_bytes),
@@ -1276,6 +1313,7 @@ impl InferenceEngine {
             created_at: Instant::now(),
             tokens: req.tokens,
             prompt_len,
+            prefill_cached_tokens: 0,
             kv_caches: vec![None; self.num_layers],
             paged_kv: paged_kv::PagedKvSequence::new(self.paged_kv_allocator.block_size()),
             logits_processor: candle_transformers::generation::LogitsProcessor::new(
@@ -1346,6 +1384,108 @@ impl InferenceEngine {
     //  Prefill
     // ─────────────────────────────────────────────────────────
 
+    fn restore_cached_prompt_prefix(&mut self, seq_id: &str) -> usize {
+        if !self.prefix_cache.enabled() {
+            return 0;
+        }
+        self.stats
+            .total_prefix_cache_lookups
+            .fetch_add(1, Ordering::Relaxed);
+        let hit = self
+            .sequences
+            .get(seq_id)
+            .and_then(|seq| self.prefix_cache.lookup(&seq.tokens[..seq.prompt_len]));
+        let Some((cached_tokens, caches)) = hit else {
+            return 0;
+        };
+        if caches.len() != self.num_layers {
+            warn!(
+                cached_layers = caches.len(),
+                expected_layers = self.num_layers,
+                "ignoring malformed prompt prefix cache entry"
+            );
+            return 0;
+        }
+        if let Some(seq) = self.sequences.get_mut(seq_id) {
+            seq.prefill_cached_tokens = cached_tokens;
+            seq.kv_caches = caches;
+        }
+        self.stats
+            .total_prefix_cache_hits
+            .fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .total_prefix_cache_hit_tokens
+            .fetch_add(cached_tokens as u64, Ordering::Relaxed);
+        cached_tokens
+    }
+
+    /// Cache only prefixes that another live request can actually consume.
+    /// Dynamic-context Orion prompts therefore allocate no cache entry, while
+    /// a shared glossary/instruction prefix is admitted after it is observed.
+    fn cache_shared_prompt_prefix(&mut self, seq_id: &str) {
+        if !self.prefix_cache.enabled() {
+            return;
+        }
+        let Some(prompt) = self
+            .sequences
+            .get(seq_id)
+            .map(|seq| seq.tokens[..seq.prompt_len].to_vec())
+        else {
+            return;
+        };
+        if prompt.len() <= self.prefix_cache.min_tokens() {
+            return;
+        }
+
+        // Always leave at least one uncached input token so the new request
+        // produces fresh logits instead of requiring a logits cache as well.
+        let max_prefix = prompt.len().saturating_sub(1);
+        let shared_tokens = self
+            .sequences
+            .iter()
+            .filter(|(id, other)| id.as_str() != seq_id && other.status == SequenceStatus::Waiting)
+            .map(|(_, other)| {
+                prefix_cache::common_prefix_len(&prompt, &other.tokens[..other.prompt_len])
+                    .min(max_prefix)
+                    .min(other.prompt_len.saturating_sub(1))
+            })
+            .max()
+            .unwrap_or(0);
+        if shared_tokens < self.prefix_cache.min_tokens() {
+            return;
+        }
+
+        let caches = self.model.get_kv_caches();
+        let insert_start = Instant::now();
+        match self.prefix_cache.insert(&prompt[..shared_tokens], &caches) {
+            Ok(true) => {
+                self.stats
+                    .total_prefix_cache_inserts
+                    .fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .total_prefix_cache_insert_tokens
+                    .fetch_add(shared_tokens as u64, Ordering::Relaxed);
+                debug!(
+                    shared_tokens,
+                    entries = self.prefix_cache.len(),
+                    bytes = self.prefix_cache.used_bytes(),
+                    "admitted shared prompt prefix KV entry"
+                );
+            }
+            Ok(false) => {}
+            Err(error) => warn!(%error, "failed to snapshot shared prompt prefix KV"),
+        }
+        self.stats
+            .total_prefix_cache_insert_time_us
+            .fetch_add(insert_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+        self.stats
+            .prefix_cache_entries
+            .store(self.prefix_cache.len() as u64, Ordering::Relaxed);
+        self.stats
+            .prefix_cache_bytes
+            .store(self.prefix_cache.used_bytes(), Ordering::Relaxed);
+    }
+
     fn step_prefill(&mut self, seq_id: String) {
         let t0 = Instant::now();
         let queue_wait_us = self
@@ -1353,6 +1493,8 @@ impl InferenceEngine {
             .get(&seq_id)
             .map(|seq| seq.created_at.elapsed().as_micros() as u64)
             .unwrap_or(0);
+
+        let cached_prompt_tokens = self.restore_cached_prompt_prefix(&seq_id);
 
         let t_swap = Instant::now();
         if !self.swap_in(&seq_id) {
@@ -1366,7 +1508,12 @@ impl InferenceEngine {
             (seq.next_input_ids().to_vec(), seq.start_pos())
         };
 
-        let prompt_len = input_ids.len();
+        let prefill_input_len = input_ids.len();
+        let prompt_len = self
+            .sequences
+            .get(&seq_id)
+            .map(|seq| seq.prompt_len)
+            .unwrap_or(prefill_input_len);
 
         let t_forward = Instant::now();
         let logits = match self.model.forward_step(&input_ids, start_pos) {
@@ -1415,6 +1562,7 @@ impl InferenceEngine {
             &[prompt_len],
             prompt_len,
         );
+        self.cache_shared_prompt_prefix(&seq_id);
 
         let t_swap = Instant::now();
         self.swap_out(&seq_id);
@@ -1458,6 +1606,7 @@ impl InferenceEngine {
             let seq = self.sequences.get_mut(&seq_id).unwrap();
             seq.tokens.push(next_token);
             seq.status = SequenceStatus::Running;
+            seq.prefill_cached_tokens = 0;
         }
         self.sync_paged_kv_for_sequence(&seq_id, prompt_len);
 
@@ -1467,6 +1616,8 @@ impl InferenceEngine {
                 stage = "prefill",
                 id = %seq_id,
                 prompt_len,
+                cached_prompt_tokens,
+                prefill_input_len,
                 queue_wait_us,
                 ttft_us,
                 total_us = prefill_us,
@@ -1482,6 +1633,8 @@ impl InferenceEngine {
         info!(
             id = %seq_id,
             prompt_len,
+            cached_prompt_tokens,
+            prefill_input_len,
             prefill_ms = prefill_us / 1000,
             prefill_tok_s = format!("{:.1}", prefill_tok_s),
             "Prefill complete, first token generated",

@@ -43,6 +43,9 @@ pub struct Sequence {
     pub tokens: Vec<u32>,
     /// Length of the original prompt (tokens before generation started).
     pub prompt_len: usize,
+    /// Prompt tokens already represented by an immutable shared prefix cache.
+    /// Only non-zero while the sequence is waiting for suffix prefill.
+    pub prefill_cached_tokens: usize,
 
     // ── KV cache (one entry per transformer layer) ──
     /// Saved KV caches when this sequence is not the one loaded in the model.
@@ -87,7 +90,7 @@ impl Sequence {
     }
 
     /// The KV cache covers tokens `0..start_pos` when we do the next forward.
-    /// For a fresh sequence, `start_pos = 0`.
+    /// For a fresh sequence, `start_pos = prefill_cached_tokens` (normally 0).
     /// After prefill of N prompt tokens, `start_pos = N`.
     /// During decode, `start_pos = tokens.len() - 1` (everything except the latest token).
     pub fn start_pos(&self) -> usize {
@@ -95,7 +98,7 @@ impl Sequence {
         // During decode each step adds one token, so the cache covers
         // tokens.len() - 1 positions (the new token hasn't been cached yet).
         if self.status == SequenceStatus::Waiting {
-            0
+            self.prefill_cached_tokens
         } else {
             self.tokens.len().saturating_sub(1)
         }
@@ -104,8 +107,8 @@ impl Sequence {
     /// Tokens to feed into the next forward step.
     pub fn next_input_ids(&self) -> &[u32] {
         if self.status == SequenceStatus::Waiting {
-            // Prefill: feed all prompt tokens.
-            &self.tokens[..self.prompt_len]
+            // Prefill: feed only the suffix not already represented by KV.
+            &self.tokens[self.prefill_cached_tokens..self.prompt_len]
         } else {
             // Decode: feed only the last generated token.
             &self.tokens[self.tokens.len() - 1..]
@@ -145,6 +148,7 @@ mod tests {
             created_at: Instant::now(),
             tokens,
             prompt_len: prompt.len(),
+            prefill_cached_tokens: 0,
             kv_caches: vec![],
             paged_kv: PagedKvSequence::default(),
             logits_processor: LogitsProcessor::new(42, Some(0.8), Some(0.95)),
@@ -200,6 +204,14 @@ mod tests {
     fn start_pos_waiting_is_zero() {
         let seq = make_seq(&[1, 2, 3], &[], 10, 0, SequenceStatus::Waiting);
         assert_eq!(seq.start_pos(), 0);
+    }
+
+    #[test]
+    fn waiting_sequence_skips_cached_prefix() {
+        let mut seq = make_seq(&[1, 2, 3, 4], &[], 10, 0, SequenceStatus::Waiting);
+        seq.prefill_cached_tokens = 2;
+        assert_eq!(seq.start_pos(), 2);
+        assert_eq!(seq.next_input_ids(), &[3, 4]);
     }
 
     #[test]
