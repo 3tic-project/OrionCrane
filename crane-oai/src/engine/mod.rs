@@ -2352,6 +2352,8 @@ impl InferenceEngine {
             };
 
             #[cfg(feature = "cuda")]
+            let mut batch_non_greedy_device_tokens: Option<Tensor> = None;
+            #[cfg(feature = "cuda")]
             let batch_non_greedy_tokens = if batch_greedy_tokens.is_none() && active_non_greedy > 0
             {
                 let t_sampling = Instant::now();
@@ -2383,6 +2385,7 @@ impl InferenceEngine {
                                     .fetch_add(active_non_greedy, Ordering::Relaxed);
                             }
                         }
+                        batch_non_greedy_device_tokens = sample.device_tokens;
                         Some(sample.tokens)
                     }
                     Ok(Some(sample)) => {
@@ -2540,12 +2543,24 @@ impl InferenceEngine {
                 }
             }
 
-            next_input_ids_device =
-                if batch_greedy_tokens.is_some() && alive.iter().all(|&is_alive| is_alive) {
+            next_input_ids_device = if alive.iter().all(|&is_alive| is_alive) {
+                if batch_greedy_tokens.is_some() {
                     batch_greedy_device_tokens
+                } else if batch_non_greedy_tokens.is_some() {
+                    #[cfg(feature = "cuda")]
+                    {
+                        batch_non_greedy_device_tokens
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        None
+                    }
                 } else {
                     None
-                };
+                }
+            } else {
+                None
+            };
 
             for p in positions.iter_mut() {
                 *p += 1;

@@ -67,6 +67,7 @@ pub struct BatchNonGreedySample {
     pub tokens: Vec<u32>,
     pub mode: BatchNonGreedyMode,
     pub active_rows: usize,
+    pub device_tokens: Option<Tensor>,
 }
 
 /// Persistent buffers for GPU-side top-k/top-p sampling.
@@ -301,11 +302,16 @@ pub fn sample_batch_non_greedy_cuda(
         &mut buffers.batch_non_greedy_cuda_buffers,
     )
     .map_err(anyhow::Error::from)?;
+    let device_tokens = buffers
+        .batch_non_greedy_cuda_buffers
+        .output_tokens_tensor_from(logits, seqs.len())
+        .ok();
 
     Ok(Some(BatchNonGreedySample {
         tokens,
         mode: BatchNonGreedyMode::CudaBf16TopKTopP,
         active_rows,
+        device_tokens,
     }))
 }
 
