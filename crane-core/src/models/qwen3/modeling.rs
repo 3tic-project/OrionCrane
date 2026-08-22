@@ -99,6 +99,40 @@ impl Qwen3RmsNorm {
         self.norm.forward(xs)
     }
 
+    /// Add a residual branch and normalize the result in one CUDA launch.
+    ///
+    /// Keeping this operation on the norm object lets the model fuse both the
+    /// attention residual with the post-attention norm and the MLP residual
+    /// with the *next* layer's input norm.
+    fn add_and_forward(&self, residual: &Tensor, hidden: &Tensor) -> Result<(Tensor, Tensor)> {
+        #[cfg(feature = "cuda")]
+        {
+            let dims = residual.dims();
+            let is_decode_step = dims.len() == 3 && dims[1] == 1 && hidden.dims() == dims;
+            if is_decode_step
+                && env_flag_default("CRANE_FUSED_ADD_RMSNORM", true)
+                && residual.device().is_cuda()
+                && hidden.device().is_cuda()
+                && residual.dtype() == DType::BF16
+                && hidden.dtype() == DType::BF16
+                && self.weight.dtype() == DType::BF16
+            {
+                if let Ok((sum, norm)) = crate::fused_ops::fused_add_rmsnorm_bf16(
+                    residual,
+                    hidden,
+                    &self.weight,
+                    self.eps as f32,
+                ) {
+                    return Ok((sum, norm));
+                }
+            }
+        }
+
+        let sum = (residual + hidden)?;
+        let norm = self.forward(&sum)?;
+        Ok((sum, norm))
+    }
+
     fn weight(&self) -> &Tensor {
         &self.weight
     }
@@ -1013,8 +1047,9 @@ impl DecoderLayer {
     ) -> Result<Tensor> {
         let residual = hidden_states;
         let hidden_states = self.input_layernorm.forward(hidden_states)?;
-        let hidden_states = self.self_attn.forward(
+        let (residual, hidden_states) = self.forward_pre_normalized(
             &hidden_states,
+            residual,
             cos,
             sin,
             rope_positions,
@@ -1024,48 +1059,121 @@ impl DecoderLayer {
             fixed_cache_width,
             append_offset,
         )?;
-        let (residual, hidden_states) =
-            self.add_and_post_attention_norm(residual, &hidden_states)?;
-        let hidden_states = self.mlp.forward(&hidden_states)?;
         &residual + &hidden_states
     }
 
-    fn add_and_post_attention_norm(
-        &self,
+    /// Run one decoder layer when its input RMSNorm has already been computed.
+    /// Returns the residual immediately before the MLP and the MLP output so
+    /// the caller can fuse their addition with the next layer's input norm.
+    fn forward_pre_normalized(
+        &mut self,
+        normalized_hidden_states: &Tensor,
         residual: &Tensor,
-        hidden: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        rope_positions: Option<&Tensor>,
+        attention_mask: Option<&Tensor>,
+        layer_idx: usize,
+        paged_attention: Option<&PagedAttentionDecodeRun<'_>>,
+        fixed_cache_width: Option<usize>,
+        append_offset: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
-        #[cfg(feature = "cuda")]
-        {
-            let dims = residual.dims();
-            let is_decode_step = dims.len() == 3 && dims[1] == 1 && hidden.dims() == dims;
-            if is_decode_step
-                && env_flag_default("CRANE_FUSED_ADD_RMSNORM", true)
-                && residual.device().is_cuda()
-                && hidden.device().is_cuda()
-                && residual.dtype() == DType::BF16
-                && hidden.dtype() == DType::BF16
-                && self.post_attention_layernorm.weight().dtype() == DType::BF16
-            {
-                if let Ok((sum, norm)) = crate::fused_ops::fused_add_rmsnorm_bf16(
-                    residual,
-                    hidden,
-                    self.post_attention_layernorm.weight(),
-                    self.post_attention_layernorm.eps() as f32,
-                ) {
-                    return Ok((sum, norm));
-                }
-            }
-        }
-
-        let sum = (residual + hidden)?;
-        let norm = self.post_attention_layernorm.forward(&sum)?;
-        Ok((sum, norm))
+        let hidden_states = self.self_attn.forward(
+            normalized_hidden_states,
+            cos,
+            sin,
+            rope_positions,
+            attention_mask,
+            layer_idx,
+            paged_attention,
+            fixed_cache_width,
+            append_offset,
+        )?;
+        let (residual, hidden_states) = self
+            .post_attention_layernorm
+            .add_and_forward(residual, &hidden_states)?;
+        let hidden_states = self.mlp.forward(&hidden_states)?;
+        Ok((residual, hidden_states))
     }
 
     fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache();
     }
+}
+
+/// Run the decoder stack and its final norm.
+///
+/// During single-token BF16 CUDA decode, carry `(residual, normalized)` across
+/// layer boundaries. This turns every `MLP output + residual` followed by the
+/// next input RMSNorm into one fused kernel (including the final model norm).
+fn forward_decoder_layers(
+    layers: &mut [DecoderLayer],
+    final_norm: &Qwen3RmsNorm,
+    hidden_states: Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    rope_positions: Option<&Tensor>,
+    attention_mask: Option<&Tensor>,
+    paged_attention: Option<&PagedAttentionDecodeRun<'_>>,
+    fixed_cache_width: Option<usize>,
+    append_offset: Option<&Tensor>,
+) -> Result<Tensor> {
+    let dims = hidden_states.dims();
+    let fuse_layer_boundaries = dims.len() == 3
+        && dims[1] == 1
+        && hidden_states.dtype() == DType::BF16
+        && hidden_states.device().is_cuda()
+        && env_flag_default("CRANE_FUSED_MLP_NEXT_NORM", true);
+
+    if !fuse_layer_boundaries || layers.is_empty() {
+        let mut hidden_states = hidden_states;
+        for (layer_idx, layer) in layers.iter_mut().enumerate() {
+            hidden_states = layer.forward(
+                &hidden_states,
+                cos,
+                sin,
+                rope_positions,
+                attention_mask,
+                layer_idx,
+                paged_attention,
+                fixed_cache_width,
+                append_offset,
+            )?;
+        }
+        return final_norm.forward(&hidden_states);
+    }
+
+    let mut residual = hidden_states;
+    let mut normalized = layers[0].input_layernorm.forward(&residual)?;
+    for layer_idx in 0..layers.len() {
+        let (post_attention_residual, mlp_output) = {
+            let layer = &mut layers[layer_idx];
+            layer.forward_pre_normalized(
+                &normalized,
+                &residual,
+                cos,
+                sin,
+                rope_positions,
+                attention_mask,
+                layer_idx,
+                paged_attention,
+                fixed_cache_width,
+                append_offset,
+            )?
+        };
+
+        if layer_idx + 1 < layers.len() {
+            (residual, normalized) = layers[layer_idx + 1]
+                .input_layernorm
+                .add_and_forward(&post_attention_residual, &mlp_output)?;
+        } else {
+            let (_, normalized) =
+                final_norm.add_and_forward(&post_attention_residual, &mlp_output)?;
+            return Ok(normalized);
+        }
+    }
+
+    unreachable!("the non-empty decoder loop always returns from its final layer")
 }
 
 // ── Full Model ──────────────────────────────────────────────────────────
@@ -1290,7 +1398,7 @@ impl Qwen3Model {
 
     // ── Forward ─────────────────────────────────────────────────────────
 
-    pub fn forward(&mut self, input_ids: &Tensor, start_pos: usize) -> Result<Tensor> {
+    fn forward_hidden(&mut self, input_ids: &Tensor, start_pos: usize) -> Result<Tensor> {
         let (_b_sz, seq_len) = input_ids.dims2()?;
 
         // Disable event tracking for the duration of the forward pass.
@@ -1330,22 +1438,23 @@ impl Qwen3Model {
             None
         };
 
-        let mut hidden_states = hidden_states;
-        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(
-                &hidden_states,
-                &cos,
-                &sin,
-                None,
-                attention_mask.as_ref(),
-                layer_idx,
-                None,
-                None,
-                None,
-            )?;
-        }
+        forward_decoder_layers(
+            &mut self.layers,
+            &self.norm,
+            hidden_states,
+            &cos,
+            &sin,
+            None,
+            attention_mask.as_ref(),
+            None,
+            None,
+            None,
+        )
+    }
 
-        let hidden_states = self.norm.forward(&hidden_states)?;
+    pub fn forward(&mut self, input_ids: &Tensor, start_pos: usize) -> Result<Tensor> {
+        let seq_len = input_ids.dim(1)?;
+        let hidden_states = self.forward_hidden(input_ids, start_pos)?;
         let logits = self
             .lm_head
             .forward(&hidden_states.narrow(1, seq_len - 1, 1)?)?;
@@ -1932,7 +2041,6 @@ impl Qwen3Model {
             (cos, sin, None)
         };
 
-        let mut hidden_states = hidden_states;
         self.last_paged_attention_layer_hits = 0;
         self.last_paged_attention_layer_fallbacks = 0;
         let paged_attention_layer_hits = std::cell::Cell::new(0usize);
@@ -1943,23 +2051,21 @@ impl Qwen3Model {
             layer_hits: &paged_attention_layer_hits,
             layer_fallbacks: &paged_attention_layer_fallbacks,
         });
-        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(
-                &hidden_states,
-                &cos,
-                &sin,
-                rope_positions.as_ref(),
-                attention_mask,
-                layer_idx,
-                paged_attention.as_ref(),
-                fixed_cache_width,
-                append_offset,
-            )?;
-        }
+        let hidden_states = forward_decoder_layers(
+            &mut self.layers,
+            &self.norm,
+            hidden_states,
+            &cos,
+            &sin,
+            rope_positions.as_ref(),
+            attention_mask,
+            paged_attention.as_ref(),
+            fixed_cache_width,
+            append_offset,
+        )?;
         self.last_paged_attention_layer_hits = paged_attention_layer_hits.get();
         self.last_paged_attention_layer_fallbacks = paged_attention_layer_fallbacks.get();
 
-        let hidden_states = self.norm.forward(&hidden_states)?;
         self.lm_head.forward(&hidden_states) // [N, 1, vocab]
     }
 
