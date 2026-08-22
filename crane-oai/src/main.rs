@@ -53,13 +53,14 @@ struct Args {
     cpu: bool,
 
     /// Max concurrent sequences in decode phase. If unset, auto-tunes from
-    /// the effective GPU memory budget: <8G → 6, <18G → 16, ≥18G → 28.
+    /// the post-load GPU memory budget: <6G → 6, <10G → 16,
+    /// <16G → 32, ≥16G → 64.
     #[arg(long)]
     max_concurrent: Option<usize>,
 
     /// Tokens to decode per sequence before switching (higher = fewer KV swaps).
-    /// If unset, auto-tunes from the effective GPU memory budget:
-    /// <18G → 16, ≥18G → 32.
+    /// If unset, auto-tunes from the post-load GPU memory budget:
+    /// <10G → 16, ≥10G → 32.
     #[arg(long)]
     decode_tokens_per_seq: Option<usize>,
 
@@ -170,23 +171,26 @@ fn query_gpu_free_total(_device: &crane_core::models::Device) -> (u64, u64) {
 /// Adaptive `(max_concurrent, decode_tokens_per_seq)` defaults.
 ///
 /// Tiers (gpu budget, inclusive lower bound):
-/// |  budget        | max_concurrent | decode_tokens_per_seq |
-/// | -------------- | -------------- | --------------------- |
-/// | < 8G           |  6             | 16                    |
-/// | 8G  ..< 18G    | 16             | 16                    |
-/// | >= 18G         | 28             | 32                    |
-/// | unknown / CPU  | 16             | 16  (middle tier)     |
+/// | post-load budget | max_concurrent | decode_tokens_per_seq |
+/// | ---------------- | -------------- | --------------------- |
+/// | < 6G             |  6             | 16                    |
+/// | 6G  ..< 10G      | 16             | 16                    |
+/// | 10G ..< 16G      | 32             | 32                    |
+/// | >= 16G           | 64             | 32                    |
+/// | unknown / CPU    | 16             | 16  (middle tier)     |
 fn adaptive_runtime_defaults(budget_bytes: u64) -> (usize, usize) {
     const G: u64 = 1u64 << 30;
     if budget_bytes == 0 {
         return (16, 16);
     }
-    if budget_bytes < 8 * G {
+    if budget_bytes < 6 * G {
         (6, 16)
-    } else if budget_bytes < 18 * G {
+    } else if budget_bytes < 10 * G {
         (16, 16)
+    } else if budget_bytes < 16 * G {
+        (32, 32)
     } else {
-        (28, 32)
+        (64, 32)
     }
 }
 
@@ -480,5 +484,18 @@ mod tests {
     fn make_error_service_unavailable() {
         let (status, _) = make_error(StatusCode::SERVICE_UNAVAILABLE, "overloaded");
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn adaptive_defaults_follow_post_load_memory_tiers() {
+        const G: u64 = 1 << 30;
+        assert_eq!(adaptive_runtime_defaults(0), (16, 16));
+        assert_eq!(adaptive_runtime_defaults(6 * G - 1), (6, 16));
+        assert_eq!(adaptive_runtime_defaults(6 * G), (16, 16));
+        assert_eq!(adaptive_runtime_defaults(10 * G - 1), (16, 16));
+        assert_eq!(adaptive_runtime_defaults(10 * G), (32, 32));
+        assert_eq!(adaptive_runtime_defaults(16 * G - 1), (32, 32));
+        assert_eq!(adaptive_runtime_defaults(16 * G), (64, 32));
+        assert_eq!(adaptive_runtime_defaults(80 * G), (64, 32));
     }
 }
