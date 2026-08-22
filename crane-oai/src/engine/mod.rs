@@ -2382,7 +2382,7 @@ impl InferenceEngine {
                         };
                         match crane_core::fused_ops::gpu_argmax_batch_readback(
                             &dev,
-                            &self.cuda_graph_sampling_buffers,
+                            &mut self.cuda_graph_sampling_buffers,
                             sample_batch,
                         ) {
                             Ok(tokens) => {

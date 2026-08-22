@@ -5,7 +5,9 @@
 //! concern under `cuda_impl/` while preserving the public fused-op API.
 
 use candle_core::backend::BackendStorage;
-use candle_core::cuda_backend::cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
+use candle_core::cuda_backend::cudarc::driver::{
+    CudaSlice, LaunchConfig, PinnedHostSlice, PushKernelArg,
+};
 use candle_core::cuda_backend::{CudaStorage, CudaStorageSlice, WrapErr};
 use candle_core::{DType, Device, Layout, Result, Shape, Tensor, WithDType};
 

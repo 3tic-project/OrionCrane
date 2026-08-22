@@ -10,10 +10,12 @@ use super::*;
 #[derive(Default)]
 pub struct BatchGreedyCudaBuffers {
     output_tokens: Option<CudaSlice<u32>>,
+    host_output_tokens: Option<PinnedHostSlice<u32>>,
     recent_token_ids: Option<CudaSlice<u32>>,
     recent_lengths: Option<CudaSlice<u32>>,
     penalties: Option<CudaSlice<f32>>,
     output_capacity: usize,
+    host_output_capacity: usize,
     recent_token_capacity: usize,
     recent_length_capacity: usize,
     penalty_capacity: usize,
@@ -23,6 +25,7 @@ pub struct BatchGreedyCudaBuffers {
 #[derive(Default)]
 pub struct BatchNonGreedyCudaBuffers {
     output_tokens: Option<CudaSlice<u32>>,
+    host_output_tokens: Option<PinnedHostSlice<u32>>,
     temperatures: Option<CudaSlice<f32>>,
     top_ks: Option<CudaSlice<u32>>,
     top_ps: Option<CudaSlice<f32>>,
@@ -31,6 +34,7 @@ pub struct BatchNonGreedyCudaBuffers {
     recent_lengths: Option<CudaSlice<u32>>,
     penalties: Option<CudaSlice<f32>>,
     output_capacity: usize,
+    host_output_capacity: usize,
     batch_capacity: usize,
     recent_token_capacity: usize,
     recent_length_capacity: usize,
@@ -39,6 +43,60 @@ pub struct BatchNonGreedyCudaBuffers {
     cached_top_ks: Vec<u32>,
     cached_top_ps: Vec<f32>,
     cached_penalties: Vec<f32>,
+}
+
+#[cfg(feature = "cuda")]
+fn pinned_token_dtoh_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("CRANE_PINNED_TOKEN_D2H").ok().as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        )
+    })
+}
+
+/// Enqueue the tiny token DtoH on Candle's model stream into reusable pinned
+/// memory, then wait on that buffer's completion event before exposing it to
+/// the CPU. This avoids allocating pageable staging storage on every decode
+/// round and confines the wait to the copy's stream-ordered event.
+#[cfg(feature = "cuda")]
+fn readback_tokens(
+    dev: &candle_core::CudaDevice,
+    output_tokens: &CudaSlice<u32>,
+    output_capacity: usize,
+    host_output_tokens: &mut Option<PinnedHostSlice<u32>>,
+    host_output_capacity: &mut usize,
+    batch_size: usize,
+) -> Result<Vec<u32>> {
+    if output_capacity < batch_size {
+        candle_core::bail!(
+            "token readback output capacity {} < requested {}",
+            output_capacity,
+            batch_size
+        )
+    }
+    let output = output_tokens.slice(0..batch_size);
+    if !pinned_token_dtoh_enabled() {
+        return dev.clone_dtoh(&output);
+    }
+
+    if *host_output_capacity < batch_size {
+        let stream = dev.cuda_stream();
+        *host_output_tokens = Some(unsafe {
+            stream
+                .context()
+                .alloc_pinned_readback::<u32>(batch_size)
+                .w()?
+        });
+        *host_output_capacity = batch_size;
+    }
+    let host = host_output_tokens
+        .as_mut()
+        .ok_or_else(|| candle_core::Error::Msg("missing pinned token readback buffer".into()))?;
+    dev.memcpy_dtoh(&output, host)?;
+    let values = host.as_slice().w()?;
+    Ok(values[..batch_size].to_vec())
 }
 
 #[cfg(feature = "cuda")]
@@ -519,7 +577,7 @@ pub fn gpu_argmax_batch_kernel_only(
 #[cfg(feature = "cuda")]
 pub fn gpu_argmax_batch_readback(
     dev: &candle_core::CudaDevice,
-    buffers: &BatchGreedyCudaBuffers,
+    buffers: &mut BatchGreedyCudaBuffers,
     batch_size: usize,
 ) -> Result<Vec<u32>> {
     if batch_size == 0 {
@@ -536,9 +594,14 @@ pub fn gpu_argmax_batch_readback(
             batch_size
         );
     }
-    let slice = output_tokens.slice(0..batch_size);
-    let result = dev.clone_dtoh(&slice)?;
-    Ok(result)
+    readback_tokens(
+        dev,
+        output_tokens,
+        buffers.output_capacity,
+        &mut buffers.host_output_tokens,
+        &mut buffers.host_output_capacity,
+        batch_size,
+    )
 }
 
 /// Batched BF16 greedy argmax with repetition penalty applied on CUDA before argmax.
@@ -915,9 +978,14 @@ pub fn gpu_sample_topk_topp_batch_bf16_cached(
         _ => candle_core::bail!("gpu_sample_topk_topp_batch_bf16_cached expects BF16 logits"),
     }
 
-    let output_tokens = output_tokens.slice(0..batch_size);
-    let result = dev.clone_dtoh(&output_tokens)?;
-    Ok(result)
+    readback_tokens(
+        dev,
+        output_tokens,
+        buffers.output_capacity,
+        &mut buffers.host_output_tokens,
+        &mut buffers.host_output_capacity,
+        batch_size,
+    )
 }
 
 // =====================================================================
