@@ -556,22 +556,24 @@ impl Attention {
                             "fixed-width decode requires KV buffer length {buf_len}, but used length would become {new_total}"
                         );
                     }
-                    // Buffer overflow — grow with extra room.
+                    // Buffer overflow — grow with extra room. Copy the old
+                    // prefix and new suffix directly into the destination;
+                    // constructing `cat(old, new)` first would allocate and
+                    // copy a second full-size temporary (especially costly
+                    // when restoring an immutable prompt-prefix cache).
                     let cur_k = buf_k.narrow(2, 0, cache_seq_len)?;
                     let cur_v = buf_v.narrow(2, 0, cache_seq_len)?;
-                    drop(buf_k);
-                    drop(buf_v);
-                    let full_k = Tensor::cat(&[&cur_k, &k], 2)?;
-                    let full_v = Tensor::cat(&[&cur_v, &v], 2)?;
-                    drop(cur_k);
-                    drop(cur_v);
-                    let total = full_k.dim(2)?;
+                    let total = new_total;
                     let room = 256; // fixed small room — avoids 2x over-allocation
-                    let (b, h, _, d) = full_k.dims4()?;
+                    let (b, h, _, d) = buf_k.dims4()?;
                     let new_buf_k = Tensor::zeros((b, h, total + room, d), k.dtype(), k.device())?;
                     let new_buf_v = Tensor::zeros((b, h, total + room, d), v.dtype(), v.device())?;
-                    new_buf_k.slice_set(&full_k, 2, 0)?;
-                    new_buf_v.slice_set(&full_v, 2, 0)?;
+                    new_buf_k.slice_set(&cur_k, 2, 0)?;
+                    new_buf_v.slice_set(&cur_v, 2, 0)?;
+                    new_buf_k.slice_set(&k, 2, cache_seq_len)?;
+                    new_buf_v.slice_set(&v, 2, cache_seq_len)?;
+                    let full_k = new_buf_k.narrow(2, 0, total)?;
+                    let full_v = new_buf_v.narrow(2, 0, total)?;
                     self.kv_cache = Some((new_buf_k, new_buf_v));
                     self.cache_seq_len = total;
                     Ok((full_k, full_v))
