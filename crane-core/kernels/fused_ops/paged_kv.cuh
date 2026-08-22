@@ -170,12 +170,26 @@ extern "C" __global__ void paged_attention_decode_bf16(
     const int head_dim,
     const float scale
 ) {
+    // Split the sequence scan across multiple warps. The previous one-warp
+    // implementation made every block execute the whole context serially and
+    // limited Ada occupancy because a single-warp block still consumes a block
+    // scheduling slot. Each warp computes an independent online-softmax state;
+    // warp 0 merges those states and writes the final head.
+    static constexpr int MAX_PAGED_ATTN_WARPS = 8;
+    static constexpr int MAX_PAGED_ATTN_HEAD_DIM = 256;
+    __shared__ float partial_max[MAX_PAGED_ATTN_WARPS];
+    __shared__ float partial_sum[MAX_PAGED_ATTN_WARPS];
+    __shared__ float partial_weight[MAX_PAGED_ATTN_WARPS];
+    __shared__ float partial_acc[MAX_PAGED_ATTN_WARPS * MAX_PAGED_ATTN_HEAD_DIM];
+
     const int row = blockIdx.x;
     const int head = blockIdx.y;
     if (row >= batch_size || head >= num_heads || num_kv_heads <= 0 || head_dim > 256) return;
 
-    const int lane = threadIdx.x;
-    if (lane >= WARP_SIZE) return;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int num_warps = blockDim.x / WARP_SIZE;
+    if (num_warps <= 0 || num_warps > MAX_PAGED_ATTN_WARPS) return;
     const int n_rep = max(num_heads / num_kv_heads, 1);
     const int kv_head = min(head / n_rep, num_kv_heads - 1);
     const int seq_len = (int)seq_lens[row];
@@ -194,18 +208,36 @@ extern "C" __global__ void paged_attention_decode_bf16(
     float q_vals[8];
     float acc_vals[8];
     int dims[8];
+    const int values_per_lane = (head_dim + WARP_SIZE - 1) / WARP_SIZE;
 #pragma unroll
     for (int slot = 0; slot < 8; ++slot) {
-        const int dim = lane + slot * WARP_SIZE;
+        const int dim = lane * values_per_lane + slot;
         dims[slot] = dim;
-        q_vals[slot] = dim < head_dim ? __bfloat162float(q_row[dim]) : 0.0f;
+        q_vals[slot] = 0.0f;
         acc_vals[slot] = 0.0f;
+    }
+    if (head_dim == 128) {
+        // Qwen3's head is exactly four BF16 values per lane. One 64-bit
+        // read replaces four scalar global loads and matches the layout used
+        // by the reference megakernel attention implementation.
+        const uint2 packed_q = __ldg(reinterpret_cast<const uint2 *>(q_row + lane * 4));
+        const __nv_bfloat16 *q4 = reinterpret_cast<const __nv_bfloat16 *>(&packed_q);
+#pragma unroll
+        for (int slot = 0; slot < 4; ++slot) {
+            q_vals[slot] = __bfloat162float(q4[slot]);
+        }
+    } else {
+#pragma unroll
+        for (int slot = 0; slot < 8; ++slot) {
+            const int dim = dims[slot];
+            q_vals[slot] = dim < head_dim ? __bfloat162float(q_row[dim]) : 0.0f;
+        }
     }
 
     float running_max = -INFINITY;
     float running_sum = 0.0f;
 
-    for (int token = 0; token <= seq_len; ++token) {
+    for (int token = warp; token <= seq_len; token += num_warps) {
         const bool is_current = token == seq_len;
         int64_t base = 0;
         bool valid = is_current;
@@ -230,43 +262,118 @@ extern "C" __global__ void paged_attention_decode_bf16(
 
         if (!valid) continue;
 
+        const __nv_bfloat16 *key_row = is_current ? cur_k_row : pages + base;
         float local_dot = 0.0f;
+        if (head_dim == 128) {
+            const uint2 packed_k = __ldg(reinterpret_cast<const uint2 *>(key_row + lane * 4));
+            const __nv_bfloat16 *k4 = reinterpret_cast<const __nv_bfloat16 *>(&packed_k);
 #pragma unroll
-        for (int slot = 0; slot < 8; ++slot) {
-            const int dim = dims[slot];
-            if (dim >= head_dim) continue;
-            const float kv = is_current
-                ? __bfloat162float(cur_k_row[dim])
-                : __bfloat162float(pages[base + dim]);
-            local_dot += q_vals[slot] * kv;
+            for (int slot = 0; slot < 4; ++slot) {
+                local_dot += q_vals[slot] * __bfloat162float(k4[slot]);
+            }
+        } else {
+#pragma unroll
+            for (int slot = 0; slot < 8; ++slot) {
+                const int dim = dims[slot];
+                if (dim < head_dim) {
+                    local_dot += q_vals[slot] * __bfloat162float(key_row[dim]);
+                }
+            }
         }
         const float dot = __shfl_sync(0xffffffff, warp_reduce_sum_f32(local_dot), 0);
         const float score = dot * scale;
-        const float next_max = fmaxf(running_max, score);
-        const float alpha = expf(running_max - next_max);
-        const float beta = expf(score - next_max);
+        float alpha;
+        float beta;
+        if (score > running_max) {
+            alpha = isinf(running_max) ? 0.0f : __expf(running_max - score);
+            beta = 1.0f;
+            running_max = score;
+        } else {
+            alpha = 1.0f;
+            beta = __expf(score - running_max);
+        }
         running_sum = running_sum * alpha + beta;
-        running_max = next_max;
 
+        const __nv_bfloat16 *value_row = is_current ? cur_v_row : pages + base + plane_stride;
+        if (head_dim == 128) {
+            const uint2 packed_v = __ldg(reinterpret_cast<const uint2 *>(value_row + lane * 4));
+            const __nv_bfloat16 *v4 = reinterpret_cast<const __nv_bfloat16 *>(&packed_v);
 #pragma unroll
-        for (int slot = 0; slot < 8; ++slot) {
-            const int dim = dims[slot];
-            if (dim >= head_dim) continue;
-            const float vv = is_current
-                ? __bfloat162float(cur_v_row[dim])
-                : __bfloat162float(pages[base + plane_stride + dim]);
-            acc_vals[slot] = acc_vals[slot] * alpha + beta * vv;
+            for (int slot = 0; slot < 4; ++slot) {
+                acc_vals[slot] = acc_vals[slot] * alpha
+                    + beta * __bfloat162float(v4[slot]);
+            }
+        } else {
+#pragma unroll
+            for (int slot = 0; slot < 8; ++slot) {
+                const int dim = dims[slot];
+                if (dim < head_dim) {
+                    acc_vals[slot] = acc_vals[slot] * alpha
+                        + beta * __bfloat162float(value_row[dim]);
+                }
+            }
         }
     }
 
-    const float denom = fmaxf(running_sum, 1.0e-20f);
+    if (lane == 0) {
+        partial_max[warp] = running_max;
+        partial_sum[warp] = running_sum;
+    }
 #pragma unroll
     for (int slot = 0; slot < 8; ++slot) {
         const int dim = dims[slot];
         if (dim < head_dim) {
-            output[((int64_t)row * num_heads + head) * head_dim + dim] =
-                __float2bfloat16(acc_vals[slot] / denom);
+            partial_acc[warp * MAX_PAGED_ATTN_HEAD_DIM + dim] = acc_vals[slot];
         }
+    }
+    __syncthreads();
+
+    // The merge factor is identical for every output dimension. Compute it
+    // once per source warp instead of evaluating expf in every output lane.
+    if (threadIdx.x == 0) {
+        float merged_max = -INFINITY;
+#pragma unroll
+        for (int source_warp = 0; source_warp < MAX_PAGED_ATTN_WARPS; ++source_warp) {
+            if (source_warp < num_warps) {
+                merged_max = fmaxf(merged_max, partial_max[source_warp]);
+            }
+        }
+        float merged_sum = 0.0f;
+#pragma unroll
+        for (int source_warp = 0; source_warp < MAX_PAGED_ATTN_WARPS; ++source_warp) {
+            if (source_warp < num_warps) {
+                const float scale = __expf(partial_max[source_warp] - merged_max);
+                partial_weight[source_warp] = scale;
+                merged_sum += partial_sum[source_warp] * scale;
+            }
+        }
+        const float inv_denom = 1.0f / fmaxf(merged_sum, 1.0e-20f);
+#pragma unroll
+        for (int source_warp = 0; source_warp < MAX_PAGED_ATTN_WARPS; ++source_warp) {
+            if (source_warp < num_warps) {
+                partial_weight[source_warp] *= inv_denom;
+            }
+        }
+    }
+    __syncthreads();
+
+    if (warp != 0) return;
+
+#pragma unroll
+    for (int slot = 0; slot < 8; ++slot) {
+        const int dim = dims[slot];
+        if (dim >= head_dim) continue;
+        float merged_acc = 0.0f;
+#pragma unroll
+        for (int source_warp = 0; source_warp < MAX_PAGED_ATTN_WARPS; ++source_warp) {
+            if (source_warp < num_warps) {
+                merged_acc += partial_acc[
+                    source_warp * MAX_PAGED_ATTN_HEAD_DIM + dim
+                ] * partial_weight[source_warp];
+            }
+        }
+        output[((int64_t)row * num_heads + head) * head_dim + dim] =
+            __float2bfloat16(merged_acc);
     }
 }
 

@@ -668,9 +668,17 @@ pub fn paged_attention_decode_bf16_with_metadata(
             .slice(0..batch_size);
 
         let func = load_func!(dev, "paged_attention_decode_bf16")?;
+        static PAGED_ATTN_THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let block_dim = *PAGED_ATTN_THREADS.get_or_init(|| {
+            std::env::var("CRANE_PAGED_KV_ATTENTION_THREADS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|&value| (32..=256).contains(&value) && value % 32 == 0)
+                .unwrap_or(256)
+        });
         let cfg = LaunchConfig {
             grid_dim: (batch_size as u32, num_heads as u32, 1),
-            block_dim: (32, 1, 1),
+            block_dim: (block_dim as u32, 1, 1),
             shared_mem_bytes: 0,
         };
 
