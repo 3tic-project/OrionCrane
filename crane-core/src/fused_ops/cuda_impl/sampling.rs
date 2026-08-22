@@ -22,7 +22,7 @@ pub struct BatchGreedyCudaBuffers {
 #[cfg(feature = "cuda")]
 #[derive(Default)]
 pub struct BatchNonGreedyCudaBuffers {
-    output_tokens: Option<CudaSlice<i32>>,
+    output_tokens: Option<CudaSlice<u32>>,
     temperatures: Option<CudaSlice<f32>>,
     top_ks: Option<CudaSlice<u32>>,
     top_ps: Option<CudaSlice<f32>>,
@@ -35,6 +35,10 @@ pub struct BatchNonGreedyCudaBuffers {
     recent_token_capacity: usize,
     recent_length_capacity: usize,
     penalty_capacity: usize,
+    cached_temperatures: Vec<f32>,
+    cached_top_ks: Vec<u32>,
+    cached_top_ps: Vec<f32>,
+    cached_penalties: Vec<f32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -45,10 +49,33 @@ impl BatchNonGreedyCudaBuffers {
 
     fn ensure_output(&mut self, dev: &candle_core::CudaDevice, len: usize) -> Result<()> {
         if self.output_capacity < len {
-            self.output_tokens = Some(unsafe { dev.alloc::<i32>(len)? });
+            self.output_tokens = Some(unsafe { dev.alloc::<u32>(len)? });
             self.output_capacity = len;
         }
         Ok(())
+    }
+
+    /// Expose the sampler's persistent output as a Tensor so the next decode
+    /// round can consume token ids without a CPU-to-GPU bounce.
+    pub fn output_tokens_tensor_from(&self, anchor: &Tensor, batch_size: usize) -> Result<Tensor> {
+        if batch_size == 0 {
+            candle_core::bail!("output_tokens_tensor_from requires non-empty batch")
+        }
+        let output_tokens = self
+            .output_tokens
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("missing output token buffer".into()))?;
+        if self.output_capacity < batch_size {
+            candle_core::bail!(
+                "non-greedy output capacity {} < requested {}",
+                self.output_capacity,
+                batch_size
+            )
+        }
+        anchor.apply_op1_no_bwd(&BatchGreedyOutputTokensTensor {
+            output_tokens: output_tokens.clone(),
+            batch_size,
+        })
     }
 
     fn ensure_batch_metadata(&mut self, dev: &candle_core::CudaDevice, len: usize) -> Result<()> {
@@ -104,6 +131,38 @@ impl BatchNonGreedyCudaBuffers {
         Ok(())
     }
 
+    fn upload_f32_if_changed(
+        slot: &mut Option<CudaSlice<f32>>,
+        cached: &mut Vec<f32>,
+        dev: &candle_core::CudaDevice,
+        src: &[f32],
+        missing: &str,
+    ) -> Result<()> {
+        if cached.as_slice() == src {
+            return Ok(());
+        }
+        Self::upload_f32(slot, dev, src, missing)?;
+        cached.clear();
+        cached.extend_from_slice(src);
+        Ok(())
+    }
+
+    fn upload_u32_if_changed(
+        slot: &mut Option<CudaSlice<u32>>,
+        cached: &mut Vec<u32>,
+        dev: &candle_core::CudaDevice,
+        src: &[u32],
+        missing: &str,
+    ) -> Result<()> {
+        if cached.as_slice() == src {
+            return Ok(());
+        }
+        Self::upload_u32(slot, dev, src, missing)?;
+        cached.clear();
+        cached.extend_from_slice(src);
+        Ok(())
+    }
+
     fn upload_recent_tokens(&mut self, dev: &candle_core::CudaDevice, src: &[u32]) -> Result<()> {
         if self.recent_token_capacity < src.len() {
             self.recent_token_ids = Some(unsafe { dev.alloc::<u32>(src.len())? });
@@ -142,8 +201,9 @@ impl BatchNonGreedyCudaBuffers {
             self.penalty_capacity = src.len();
         }
         if !src.is_empty() {
-            Self::upload_f32(
+            Self::upload_f32_if_changed(
                 &mut self.penalties,
+                &mut self.cached_penalties,
                 dev,
                 src,
                 "missing non-greedy penalty buffer",
@@ -749,20 +809,23 @@ pub fn gpu_sample_topk_topp_batch_bf16_cached(
 
     buffers.ensure_output(dev, batch_size)?;
     buffers.ensure_batch_metadata(dev, batch_size)?;
-    BatchNonGreedyCudaBuffers::upload_f32(
+    BatchNonGreedyCudaBuffers::upload_f32_if_changed(
         &mut buffers.temperatures,
+        &mut buffers.cached_temperatures,
         dev,
         temperatures,
         "missing temperature buffer",
     )?;
-    BatchNonGreedyCudaBuffers::upload_u32(
+    BatchNonGreedyCudaBuffers::upload_u32_if_changed(
         &mut buffers.top_ks,
+        &mut buffers.cached_top_ks,
         dev,
         top_ks,
         "missing top-k buffer",
     )?;
-    BatchNonGreedyCudaBuffers::upload_f32(
+    BatchNonGreedyCudaBuffers::upload_f32_if_changed(
         &mut buffers.top_ps,
+        &mut buffers.cached_top_ps,
         dev,
         top_ps,
         "missing top-p buffer",
@@ -793,10 +856,37 @@ pub fn gpu_sample_topk_topp_batch_bf16_cached(
         .as_ref()
         .ok_or_else(|| candle_core::Error::Msg("missing seed buffer".into()))?
         .slice(0..batch_size);
-    let func = load_func!(dev, "gpu_sample_topk_topp_batch_bf16")?;
-    let block_dim = 64usize;
-    let shared_mem_bytes =
-        block_dim * max_top_k * (std::mem::size_of::<f32>() + std::mem::size_of::<u32>());
+    static LEGACY_SAMPLER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let legacy = *LEGACY_SAMPLER.get_or_init(|| {
+        matches!(
+            std::env::var("CRANE_BATCH_SAMPLER_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        )
+    });
+    let (func, block_dim, shared_mem_bytes) = if legacy {
+        let func = load_func!(dev, "gpu_sample_topk_topp_batch_bf16_legacy")?;
+        let block_dim = 64usize;
+        let shared_mem_bytes =
+            block_dim * max_top_k * (std::mem::size_of::<f32>() + std::mem::size_of::<u32>());
+        (func, block_dim, shared_mem_bytes)
+    } else {
+        static RADIX_THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let block_dim = *RADIX_THREADS.get_or_init(|| {
+            std::env::var("CRANE_BATCH_SAMPLER_THREADS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|&value| (32..=1024).contains(&value) && value % 32 == 0)
+                .unwrap_or(1024)
+        });
+        // One block per row. The BF16 radix sampler uses static shared memory
+        // and avoids per-thread 64-entry insertion lists. Wider blocks can
+        // improve vocabulary scans when the batch does not fill all SMs.
+        (
+            load_func!(dev, "gpu_sample_topk_topp_batch_bf16")?,
+            block_dim,
+            0usize,
+        )
+    };
     match &cuda_storage.slice {
         CudaStorageSlice::BF16(logits) => {
             let logits = logits.slice(o1..o2);
@@ -827,10 +917,7 @@ pub fn gpu_sample_topk_topp_batch_bf16_cached(
 
     let output_tokens = output_tokens.slice(0..batch_size);
     let result = dev.clone_dtoh(&output_tokens)?;
-    Ok(result
-        .into_iter()
-        .map(|token| token.max(0) as u32)
-        .collect())
+    Ok(result)
 }
 
 // =====================================================================

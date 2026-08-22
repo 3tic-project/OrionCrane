@@ -263,13 +263,28 @@ __device__ __forceinline__ float uniform01_from_seed(uint64_t seed) {
     return fminf(((float)bits + 0.5f) * (1.0f / 16777216.0f), 0.99999994f);
 }
 
-extern "C" __global__ void gpu_sample_topk_topp_batch_bf16(
-    const __nv_bfloat16 *__restrict__ logits,       // [batch_size, vocab_size]
-    int32_t             *__restrict__ output_tokens,
-    const float         *__restrict__ temperatures, // [batch_size]
-    const uint32_t      *__restrict__ top_ks,       // [batch_size], 0 means inactive
-    const float         *__restrict__ top_ps,       // [batch_size]
-    const uint64_t      *__restrict__ seeds,        // [batch_size]
+// Map a non-NaN BF16 bit pattern to an unsigned key whose natural ordering is
+// the same as floating-point ordering.  A two-byte radix histogram can then
+// find the exact kth-largest BF16 value without maintaining a 64-entry sorted
+// list for every thread while scanning the vocabulary.
+__device__ __forceinline__ uint16_t ordered_bf16_key(__nv_bfloat16 value) {
+    const uint16_t bits = __bfloat16_as_ushort(value);
+    return (bits & 0x8000u) ? (uint16_t)~bits : (uint16_t)(bits ^ 0x8000u);
+}
+
+__device__ __forceinline__ bool bf16_is_nan_bits(__nv_bfloat16 value) {
+    const uint16_t bits = __bfloat16_as_ushort(value);
+    return (bits & 0x7f80u) == 0x7f80u && (bits & 0x007fu) != 0;
+}
+
+// Retained as an opt-in A/B fallback for validating the radix-select sampler.
+extern "C" __global__ void gpu_sample_topk_topp_batch_bf16_legacy(
+    const __nv_bfloat16 *__restrict__ logits,
+    uint32_t            *__restrict__ output_tokens,
+    const float         *__restrict__ temperatures,
+    const uint32_t      *__restrict__ top_ks,
+    const float         *__restrict__ top_ps,
+    const uint64_t      *__restrict__ seeds,
     const int batch_size,
     const int vocab_size,
     const int max_top_k
@@ -281,7 +296,7 @@ extern "C" __global__ void gpu_sample_topk_topp_batch_bf16(
     const int block_size = blockDim.x;
     int k = (int)top_ks[row];
     if (k <= 0) {
-        if (tid == 0) output_tokens[row] = -1;
+        if (tid == 0) output_tokens[row] = 0;
         return;
     }
     k = min(k, max_top_k);
@@ -297,14 +312,14 @@ extern "C" __global__ void gpu_sample_topk_topp_batch_bf16(
 
     const __nv_bfloat16 *row_logits = logits + (int64_t)row * vocab_size;
     for (int token = tid; token < vocab_size; token += block_size) {
-        float v = __bfloat162float(row_logits[token]);
-        if (isnan(v)) continue;
-        topk_insert(v, (uint32_t)token, vals, idx, k);
+        const float value = __bfloat162float(row_logits[token]);
+        if (!isnan(value)) topk_insert(value, (uint32_t)token, vals, idx, k);
     }
 
-    extern __shared__ uint8_t smem_sample[];
-    float *block_vals = (float *)smem_sample;
-    uint32_t *block_idx = (uint32_t *)(block_vals + (uint32_t)block_size * max_top_k);
+    extern __shared__ uint8_t smem_sample_legacy[];
+    float *block_vals = (float *)smem_sample_legacy;
+    uint32_t *block_idx =
+        (uint32_t *)(block_vals + (uint32_t)block_size * max_top_k);
     const int base = tid * max_top_k;
     for (int j = 0; j < k; ++j) {
         block_vals[base + j] = vals[j];
@@ -325,16 +340,245 @@ extern "C" __global__ void gpu_sample_topk_topp_batch_bf16(
         best_vals[j] = -INFINITY;
         best_idx[j] = 0;
     }
-    for (int t = 0; t < block_size; ++t) {
-        const int tbase = t * max_top_k;
+    for (int thread = 0; thread < block_size; ++thread) {
+        const int thread_base = thread * max_top_k;
         for (int j = 0; j < k; ++j) {
-            topk_insert(block_vals[tbase + j], block_idx[tbase + j], best_vals, best_idx, k);
+            topk_insert(
+                block_vals[thread_base + j],
+                block_idx[thread_base + j],
+                best_vals,
+                best_idx,
+                k
+            );
         }
     }
 
     const float temperature = temperatures[row];
     if (temperature <= 0.0f || k == 1) {
-        output_tokens[row] = (int32_t)best_idx[0];
+        output_tokens[row] = best_idx[0];
+        return;
+    }
+
+    const float inv_temp = 1.0f / fmaxf(temperature, 1.0e-6f);
+    const float max_score = best_vals[0] * inv_temp;
+    float probs[64];
+    float total = 0.0f;
+    for (int j = 0; j < k; ++j) {
+        probs[j] = expf(best_vals[j] * inv_temp - max_score);
+        total += probs[j];
+    }
+
+    const float top_p = top_ps[row];
+    int cutoff = k;
+    if (top_p > 0.0f && top_p < 1.0f && total > 0.0f) {
+        const float threshold = top_p * total;
+        float running = 0.0f;
+        cutoff = 1;
+        for (int j = 0; j < k; ++j) {
+            running += probs[j];
+            cutoff = j + 1;
+            if (running >= threshold) break;
+        }
+    }
+
+    float sample_total = 0.0f;
+    for (int j = 0; j < cutoff; ++j) sample_total += probs[j];
+    if (sample_total <= 0.0f || !isfinite(sample_total)) {
+        output_tokens[row] = best_idx[0];
+        return;
+    }
+
+    const float sample = uniform01_from_seed(seeds[row]) * sample_total;
+    float running = 0.0f;
+    int chosen = cutoff - 1;
+    for (int j = 0; j < cutoff; ++j) {
+        running += probs[j];
+        if (sample <= running) {
+            chosen = j;
+            break;
+        }
+    }
+    output_tokens[row] = best_idx[chosen];
+}
+
+extern "C" __global__ void gpu_sample_topk_topp_batch_bf16(
+    const __nv_bfloat16 *__restrict__ logits,       // [batch_size, vocab_size]
+    uint32_t            *__restrict__ output_tokens,
+    const float         *__restrict__ temperatures, // [batch_size]
+    const uint32_t      *__restrict__ top_ks,       // [batch_size], 0 means inactive
+    const float         *__restrict__ top_ps,       // [batch_size]
+    const uint64_t      *__restrict__ seeds,        // [batch_size]
+    const int batch_size,
+    const int vocab_size,
+    const int max_top_k
+) {
+    const int row = blockIdx.x;
+    if (row >= batch_size || max_top_k <= 0 || max_top_k > 64) return;
+
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+    int k = (int)top_ks[row];
+    if (k <= 0) {
+        if (tid == 0) output_tokens[row] = 0;
+        return;
+    }
+    k = min(k, max_top_k);
+    k = min(k, vocab_size);
+
+    const __nv_bfloat16 *row_logits = logits + (int64_t)row * vocab_size;
+
+    __shared__ uint32_t histogram[256];
+    __shared__ uint32_t high_threshold;
+    __shared__ uint32_t cutoff_key;
+    __shared__ uint32_t strict_count;
+    __shared__ uint32_t strict_written;
+    __shared__ uint32_t ties_written;
+    __shared__ float best_vals[64];
+    __shared__ uint32_t best_idx[64];
+
+    // Keep the launch width tunable.  Wider blocks expose more of a single
+    // vocabulary row to the GPU (important when batch_size is well below the
+    // SM count), while the histogram itself remains fixed at 256 bins.
+    for (int bin = tid; bin < 256; bin += block_size) histogram[bin] = 0;
+    __syncthreads();
+
+    // First radix pass: histogram the high byte.  Warp-aggregated atomics
+    // avoid serializing all lanes when logits cluster in a small value range.
+    for (int base = 0; base < vocab_size; base += block_size) {
+        const int token = base + tid;
+        const bool in_range = token < vocab_size;
+        const __nv_bfloat16 value = in_range ? row_logits[token] : __float2bfloat16(0.0f);
+        const bool valid = in_range && !bf16_is_nan_bits(value);
+        const unsigned active = __ballot_sync(0xffffffffu, valid);
+        if (valid) {
+            const uint32_t bin = (uint32_t)(ordered_bf16_key(value) >> 8);
+            const unsigned peers = __match_any_sync(active, bin);
+            if ((threadIdx.x & 31) == (__ffs((int)peers) - 1)) {
+                atomicAdd(&histogram[bin], (uint32_t)__popc(peers));
+            }
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        uint32_t above = 0;
+        uint32_t threshold = 0;
+        for (int bin = 255; bin >= 0; --bin) {
+            const uint32_t count = histogram[bin];
+            if (above + count >= (uint32_t)k) {
+                threshold = (uint32_t)bin;
+                break;
+            }
+            above += count;
+        }
+        high_threshold = threshold;
+        // Retain this count: it is exactly the number of candidates above the
+        // selected high-byte bucket, so there is no reason to scan the full
+        // vocabulary again after the low-byte pass.
+        strict_count = above;
+    }
+    __syncthreads();
+    for (int bin = tid; bin < 256; bin += block_size) histogram[bin] = 0;
+    __syncthreads();
+
+    // Second radix pass only touches values in the selected high-byte bucket.
+    for (int base = 0; base < vocab_size; base += block_size) {
+        const int token = base + tid;
+        const bool in_range = token < vocab_size;
+        const __nv_bfloat16 value = in_range ? row_logits[token] : __float2bfloat16(0.0f);
+        const bool valid = in_range && !bf16_is_nan_bits(value);
+        const uint32_t key = valid ? (uint32_t)ordered_bf16_key(value) : 0;
+        const bool in_bucket = valid && (key >> 8) == high_threshold;
+        const unsigned active = __ballot_sync(0xffffffffu, in_bucket);
+        if (in_bucket) {
+            const uint32_t bin = key & 0xffu;
+            const unsigned peers = __match_any_sync(active, bin);
+            if ((threadIdx.x & 31) == (__ffs((int)peers) - 1)) {
+                atomicAdd(&histogram[bin], (uint32_t)__popc(peers));
+            }
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        const uint32_t need = (uint32_t)k - strict_count;
+        uint32_t above = 0;
+        uint32_t threshold = 0;
+        for (int bin = 255; bin >= 0; --bin) {
+            const uint32_t count = histogram[bin];
+            if (above + count >= need) {
+                threshold = (uint32_t)bin;
+                break;
+            }
+            above += count;
+        }
+        cutoff_key = (high_threshold << 8) | threshold;
+        strict_count += above;
+        strict_written = 0;
+        ties_written = 0;
+    }
+    __syncthreads();
+
+    // One final vocabulary pass gathers both strict winners and enough cutoff
+    // ties. The two independent counters make their destination ranges
+    // disjoint even though blocks encounter the two classes in arbitrary
+    // token order. Ties use one atomic reservation per warp.
+    for (int base_token = 0; base_token < vocab_size; base_token += block_size) {
+        const int token = base_token + tid;
+        const bool in_range = token < vocab_size;
+        const __nv_bfloat16 value =
+            in_range ? row_logits[token] : __float2bfloat16(0.0f);
+        const bool valid = in_range && !bf16_is_nan_bits(value);
+        const uint32_t key = valid ? (uint32_t)ordered_bf16_key(value) : 0;
+
+        if (valid && key > cutoff_key) {
+            const uint32_t slot = atomicAdd(&strict_written, 1u);
+            if (slot < strict_count) {
+                best_vals[slot] = __bfloat162float(value);
+                best_idx[slot] = (uint32_t)token;
+            }
+        }
+
+        const bool wanted = valid && key == cutoff_key;
+        const unsigned peers = __ballot_sync(0xffffffffu, wanted);
+        if (wanted) {
+            const int lane = threadIdx.x & 31;
+            const int leader = __ffs((int)peers) - 1;
+            uint32_t base = 0;
+            if (lane == leader) base = atomicAdd(&ties_written, (uint32_t)__popc(peers));
+            base = __shfl_sync(peers, base, leader);
+            const uint32_t rank = (uint32_t)__popc(peers & ((1u << lane) - 1u));
+            const uint32_t slot = strict_count + base + rank;
+            if (slot < (uint32_t)k) {
+                best_vals[slot] = __bfloat162float(value);
+                best_idx[slot] = (uint32_t)token;
+            }
+        }
+    }
+    __syncthreads();
+
+    if (tid != 0) return;
+
+    // Sort only the final <=64 candidates. Stable token-id tie breaking keeps
+    // deterministic seeds deterministic even when BF16 logits are equal.
+    for (int i = 1; i < k; ++i) {
+        const float value = best_vals[i];
+        const uint32_t token = best_idx[i];
+        int j = i;
+        while (j > 0
+               && (value > best_vals[j - 1]
+                   || (value == best_vals[j - 1] && token < best_idx[j - 1]))) {
+            best_vals[j] = best_vals[j - 1];
+            best_idx[j] = best_idx[j - 1];
+            --j;
+        }
+        best_vals[j] = value;
+        best_idx[j] = token;
+    }
+
+    const float temperature = temperatures[row];
+    if (temperature <= 0.0f || k == 1) {
+        output_tokens[row] = best_idx[0];
         return;
     }
 
@@ -363,7 +607,7 @@ extern "C" __global__ void gpu_sample_topk_topp_batch_bf16(
     float sample_total = 0.0f;
     for (int j = 0; j < cutoff; ++j) sample_total += probs[j];
     if (sample_total <= 0.0f || !isfinite(sample_total)) {
-        output_tokens[row] = (int32_t)best_idx[0];
+        output_tokens[row] = best_idx[0];
         return;
     }
 
@@ -377,6 +621,5 @@ extern "C" __global__ void gpu_sample_topk_topp_batch_bf16(
             break;
         }
     }
-    output_tokens[row] = (int32_t)best_idx[chosen];
+    output_tokens[row] = best_idx[chosen];
 }
-
