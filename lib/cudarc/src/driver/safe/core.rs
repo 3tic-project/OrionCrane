@@ -1505,11 +1505,33 @@ impl CudaContext {
         self: &Arc<Self>,
         len: usize,
     ) -> Result<PinnedHostSlice<T>, DriverError> {
+        self.alloc_pinned_with_flags(len, sys::CU_MEMHOSTALLOC_WRITECOMBINED)
+    }
+
+    /// Allocates page-locked host memory intended for device-to-host copies.
+    ///
+    /// Unlike [`CudaContext::alloc_pinned`], this deliberately omits
+    /// `CU_MEMHOSTALLOC_WRITECOMBINED`: write-combined mappings improve host
+    /// writes for HtoD traffic, but make CPU reads needlessly expensive. The
+    /// default CUDA host-allocation flags are the appropriate choice for a
+    /// buffer which the device writes and the CPU reads.
+    ///
+    /// # Safety
+    /// 1. This is unsafe because the memory is unset after this call.
+    pub unsafe fn alloc_pinned_readback<T: DeviceRepr>(
+        self: &Arc<Self>,
+        len: usize,
+    ) -> Result<PinnedHostSlice<T>, DriverError> {
+        self.alloc_pinned_with_flags(len, 0)
+    }
+
+    unsafe fn alloc_pinned_with_flags<T: DeviceRepr>(
+        self: &Arc<Self>,
+        len: usize,
+        flags: u32,
+    ) -> Result<PinnedHostSlice<T>, DriverError> {
         self.bind_to_thread()?;
-        let ptr = result::malloc_host(
-            len * std::mem::size_of::<T>(),
-            sys::CU_MEMHOSTALLOC_WRITECOMBINED,
-        )?;
+        let ptr = result::malloc_host(len * std::mem::size_of::<T>(), flags)?;
         let ptr = ptr as *mut T;
         assert!(!ptr.is_null());
         assert!(len * std::mem::size_of::<T>() < isize::MAX as usize);
@@ -1748,11 +1770,14 @@ impl CudaStream {
         src: &Src,
         dst: &mut Dst,
     ) -> Result<(), DriverError> {
-        assert!(dst.len() >= src.len());
+        let src_len = src.len();
+        assert!(dst.len() >= src_len);
         self.ctx.bind_to_thread()?;
         let (src, _record_src) = src.device_ptr(self);
         let (dst, _record_dst) = unsafe { dst.stream_synced_mut_slice(self) };
-        unsafe { result::memcpy_dtoh_async(dst, src, self.cu_stream) }
+        // `dst` may be a reusable capacity buffer larger than this transfer.
+        // Copying its full length would read beyond the source allocation.
+        unsafe { result::memcpy_dtoh_async(&mut dst[..src_len], src, self.cu_stream) }
     }
 
     /// Copy a [`CudaSlice`]/[`CudaView`] to a existing [`CudaSlice`]/[`CudaViewMut`].
@@ -2763,6 +2788,22 @@ mod tests {
         let dst = stream.clone_htod(&pinned).unwrap();
         let host = stream.clone_dtoh(&dst).unwrap();
         assert_eq!(&host, &truth);
+    }
+
+    #[test]
+    fn test_dtoh_copy_pinned_readback_with_spare_capacity() {
+        let truth = [11u32, 22, 33, 44];
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
+        let src = stream.clone_htod(&truth).unwrap();
+        let mut pinned = unsafe { ctx.alloc_pinned_readback::<u32>(8) }.unwrap();
+        pinned.as_mut_slice().unwrap().fill(u32::MAX);
+
+        stream.memcpy_dtoh(&src, &mut pinned).unwrap();
+
+        let host = pinned.as_slice().unwrap();
+        assert_eq!(&host[..truth.len()], &truth);
+        assert_eq!(&host[truth.len()..], &[u32::MAX; 4]);
     }
 
     #[test]
