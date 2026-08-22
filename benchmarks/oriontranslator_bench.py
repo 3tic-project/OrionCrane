@@ -202,6 +202,16 @@ def run_round(args: argparse.Namespace, count: int, offset: int) -> list[Request
         return [future.result() for future in concurrent.futures.as_completed(futures)]
 
 
+def fetch_engine_stats(endpoint: str, timeout: float) -> dict[str, object] | None:
+    base = endpoint.split("/v1/", 1)[0].rstrip("/")
+    try:
+        with urllib.request.urlopen(f"{base}/v1/stats", timeout=timeout) as response:
+            value = json.load(response)
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError, urllib.error.HTTPError):
+        return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--endpoint", default="http://127.0.0.1:9633/v1/chat/completions")
@@ -236,6 +246,7 @@ def main() -> int:
     latencies = [result.latency_s for result in successful]
     completion_tokens = sum(result.completion_tokens for result in successful)
     output_chars = sum(result.output_chars for result in successful)
+    engine_stats = fetch_engine_stats(args.endpoint, min(args.timeout, 10.0))
     report = {
         "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "config": vars(args) | {"output": str(args.output) if args.output else None},
@@ -254,6 +265,7 @@ def main() -> int:
             "latency_p95_s": percentile(latencies, 0.95),
             "latency_p99_s": percentile(latencies, 0.99),
         },
+        "engine_stats": engine_stats,
         "errors": [dataclasses.asdict(result) for result in results if result.error],
     }
     rendered = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)

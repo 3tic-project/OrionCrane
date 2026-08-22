@@ -3,6 +3,7 @@ Cargo.lock
 .DS_Store
 *.onnx
 outputs/
+__pycache__/
 *.bin
 .vscode/
 checkpoints/
