@@ -545,12 +545,10 @@ impl InferenceEngine {
             );
             if engine.cuda_graph_decode.capture_runtime() {
                 info!(
-                    "CRANE_CUDA_GRAPH_DECODE_CAPTURE=1: graph capture+reuse is enabled. \
-                     The Round 5 stale-RoPE-max_position drift was fixed (2026-04-30); \
-                     replays now produce baseline-equivalent token distributions. \
-                     Performance is on par with eager batched decode at MC<=64 in current \
-                     measurements — opt-in for determinism, not for speedup. \
-                     See docs/qwen3/benchmarks/qwen3_round5_cuda_graph_2026_05_08.md."
+                    "CRANE_CUDA_GRAPH_DECODE_CAPTURE=1: graph capture+reuse is enabled for \
+                     configured batch buckets. Non-bucket ragged batches stay eager. \
+                     Allocation retention keeps replay pointers valid, but production \
+                     OrionTranslator sampling still defaults to eager after A/B testing."
                 );
             }
         }
@@ -1867,8 +1865,8 @@ impl InferenceEngine {
             let mask_width = original_max_kv + round + 1;
             let paged_attention_context =
                 self.maybe_build_paged_attention_context(&batch, &kv_lens, round, &alive);
-            let fixed_width_round =
-                self.cuda_graph_decode.fixed_width_decode() && paged_attention_context.is_none();
+            let fixed_width_round = self.cuda_graph_decode.fixed_width_decode_for(batch_size)
+                && paged_attention_context.is_none();
             let use_device_input_ids = decode_device_token_input_enabled
                 && !fixed_width_round
                 && alive.iter().all(|&is_alive| is_alive);
@@ -2112,7 +2110,12 @@ impl InferenceEngine {
                         }
                     }
                 } else {
-                    self.record_cuda_graph_decode_fallback(active_rows);
+                    if matches!(
+                        graph_decision,
+                        cuda_graph::CudaGraphDecodeDecision::Ready { .. }
+                    ) {
+                        self.record_cuda_graph_decode_fallback(active_rows);
+                    }
                     self.model.step_batch_decode_fixed_width_with_position_ids(
                         &input_ids,
                         &positions,
@@ -2127,7 +2130,12 @@ impl InferenceEngine {
 
                 #[cfg(not(feature = "cuda"))]
                 {
-                    self.record_cuda_graph_decode_fallback(active_rows);
+                    if matches!(
+                        graph_decision,
+                        cuda_graph::CudaGraphDecodeDecision::Ready { .. }
+                    ) {
+                        self.record_cuda_graph_decode_fallback(active_rows);
+                    }
                     self.model.step_batch_decode_fixed_width_with_position_ids(
                         &input_ids,
                         &positions,

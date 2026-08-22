@@ -15,7 +15,7 @@ use candle_core::{DType, Device};
 
 use super::{env_flag, env_flag_default, is_cuda_device, stats::EngineStats, InferenceEngine};
 
-const DEFAULT_BUCKETS: &[usize] = &[1, 2, 4, 8, 16];
+const DEFAULT_BUCKETS: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
 
 #[derive(Debug, Clone)]
 pub(super) struct CudaGraphDecodePlanner {
@@ -25,11 +25,12 @@ pub(super) struct CudaGraphDecodePlanner {
     /// Capture the greedy sampling argmax kernel inside the decode graph
     /// (P4-A). Eliminates one out-of-graph `cuLaunchKernel` per decode step
     /// and fuses the argmax into the same `cuGraphLaunch`. Read back via a
-    /// single DtoH after replay. Defaults ON when capture_runtime is on.
+    /// single DtoH after replay. Kept opt-in because OrionTranslator uses
+    /// non-greedy sampling and cannot take this path.
     capture_sampling: bool,
     /// Maximum replays per captured graph entry before forced re-capture.
-    /// 0 = unlimited (legacy behaviour). Setting this to a small value (e.g. 4)
-    /// is a workaround for the stale-pointer drift bug; see qwen3_round5.
+    /// 0 = unlimited. A finite value is useful for allocator/lifetime stress
+    /// testing without restarting the server.
     max_replays: u32,
     buckets: Vec<usize>,
 }
@@ -78,30 +79,13 @@ impl CudaGraphDecodePlanner {
     pub(super) fn from_env() -> Self {
         // `CRANE_CUDA_GRAPH_DECODE` defaults OFF.
         //
-        // Round 5 (2026-05-08) bisection — see
-        // docs/qwen3/benchmarks/qwen3_round5_cuda_graph_2026_05_08.md:
-        //
-        // * Per-round capture (`CRANE_CUDA_GRAPH_DECODE_NO_REUSE=1`):
-        //   tokens generated == eager (3815 vs 3802), but capture overhead
-        //   dwarfs the launch-overhead win → +48 % wall time.
-        // * Capture + reuse (`CRANE_CUDA_GRAPH_DECODE_CAPTURE=1`): forward
-        //   3.5× faster (296 → 84 µs/token) but tokens generated +77 %
-        //   (3802 → 6734) because the captured graph reads stale device
-        //   memory on replay → strict-JSON outputs corrupt → +30 % wall time.
-        //
-        // Root cause is not in our code: candle/cudarc's stream allocator
-        // frees the per-call intermediate tensors after capture, then hands
-        // those slots to subsequent ops. The captured graph nodes have those
-        // device pointers baked in, so replay reads whoever wrote there last.
-        // The fix needs `cudaGraphAddMemAllocNode` (not exposed by cudarc) or
-        // a graph-aware allocator, both of which require modifying the
-        // candle/cudarc dependency chain.
-        //
-        // Until then, capture stays opt-in with a hard startup warning. The
-        // fixed-width decode path itself is correct and can be enabled
-        // independently as a shape stabilizer (planner-only mode), but it
-        // does not measurably beat eager batch_decode at the concurrencies
-        // we run, so it also defaults OFF.
+        // The local cudarc fork retains capture-time device/host allocations,
+        // fixing the original stale-pointer replay corruption. CUDA Graphs
+        // remain opt-in for performance: deterministic greedy translation can
+        // benefit at stable power-of-two batches, while the production
+        // temperature/top-k/top-p workload is ragged and still favors eager.
+        // `fixed_width_decode_for` ensures non-bucket batches do not pay the
+        // fixed-width metadata cost just to fall back.
         let enabled = env_flag("CRANE_CUDA_GRAPH_DECODE");
         let buckets = parse_buckets(
             std::env::var("CRANE_CUDA_GRAPH_DECODE_BUCKETS")
@@ -145,6 +129,13 @@ impl CudaGraphDecodePlanner {
 
     pub(super) fn fixed_width_decode(&self) -> bool {
         self.fixed_width_decode
+    }
+
+    /// Fixed-width metadata only pays for itself when this batch can actually
+    /// use a graph entry. Ragged batch sizes outside the configured buckets
+    /// should stay on the faster eager path.
+    pub(super) fn fixed_width_decode_for(&self, batch_size: usize) -> bool {
+        self.fixed_width_decode && self.bucket_for(batch_size).is_some()
     }
 
     pub(super) fn capture_runtime(&self) -> bool {
@@ -338,8 +329,8 @@ mod tests {
 
     #[test]
     fn parse_buckets_uses_defaults_when_empty() {
-        assert_eq!(parse_buckets(Some("bad,0")), vec![1, 2, 4, 8, 16]);
-        assert_eq!(parse_buckets(None), vec![1, 2, 4, 8, 16]);
+        assert_eq!(parse_buckets(Some("bad,0")), vec![1, 2, 4, 8, 16, 32, 64]);
+        assert_eq!(parse_buckets(None), vec![1, 2, 4, 8, 16, 32, 64]);
     }
 
     #[test]
@@ -380,6 +371,22 @@ mod tests {
         assert!(mask_blocks_capture(true, false));
         assert!(!mask_blocks_capture(true, true));
         assert!(!mask_blocks_capture(false, false));
+    }
+
+    #[test]
+    fn fixed_width_is_limited_to_configured_batch_buckets() {
+        let planner = CudaGraphDecodePlanner {
+            enabled: true,
+            fixed_width_decode: true,
+            capture_runtime: true,
+            capture_sampling: false,
+            max_replays: 0,
+            buckets: vec![1, 8, 32],
+        };
+        assert!(planner.fixed_width_decode_for(1));
+        assert!(planner.fixed_width_decode_for(32));
+        assert!(!planner.fixed_width_decode_for(7));
+        assert!(!planner.fixed_width_decode_for(64));
     }
 
     #[cfg(feature = "cuda")]

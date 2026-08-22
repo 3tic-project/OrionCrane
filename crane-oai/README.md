@@ -168,7 +168,7 @@ widths). All are read at server start.
 | `CRANE_CUDA_GRAPH_DECODE_CAPTURE` | off | Capture and replay decode graphs (requires the master switch). |
 | `CRANE_CUDA_GRAPH_DECODE_WIDTH_BUCKET` | **on** | Bucket the cache width to the next power of two so successive batches share captured graphs. Safe with capture off; provides ~6–10% throughput when capture is on. |
 | `CRANE_CUDA_GRAPH_DECODE_CAPTURE_SAMPLING` | off | Capture greedy argmax inside the decode graph. Only fires for greedy, no-penalty workloads. |
-| `CRANE_CUDA_GRAPH_DECODE_BUCKETS` | adaptive | Override the batch-size buckets used for graph capture (e.g. `1,2,4,8,16,32`). |
+| `CRANE_CUDA_GRAPH_DECODE_BUCKETS` | `1,2,4,8,16,32,64` | Exact batch sizes eligible for fixed-width graph capture. Other ragged sizes stay on eager decode. |
 | `CRANE_CUDA_GRAPH_DECODE_MAX_REPLAYS` | unbounded | Evict and recapture a graph after this many replays (debugging). |
 | `CRANE_DISABLE_GPU_MEM_HARD_CHECK` | **on** | Bypass `cuMemGetInfo`/baseline based preemption by default for shared-GPU throughput runs. Set `0` to enforce `--gpu-memory-limit`. |
 
