@@ -350,14 +350,21 @@ struct PagedAttentionDecodeRun<'a> {
     layer_fallbacks: &'a std::cell::Cell<usize>,
 }
 
+/// QKV projection storage. Standard weights are merged and the three source
+/// tensors are released after construction; quantized GGUF projections remain
+/// separate because their packed formats cannot be concatenated directly.
+enum AttentionQkv {
+    Merged(Linear),
+    Separate {
+        q_proj: LinearLayer,
+        k_proj: LinearLayer,
+        v_proj: LinearLayer,
+    },
+}
+
 struct Attention {
-    q_proj: LinearLayer,
-    k_proj: LinearLayer,
-    v_proj: LinearLayer,
+    qkv: AttentionQkv,
     o_proj: LinearLayer,
-    /// Merged QKV weight [q_dim + 2*kv_dim, hidden_size] — one gemv instead of 3.
-    /// Only set for Standard (non-quantized) weights.
-    qkv_proj: Option<Linear>,
     q_norm: Option<Qwen3RmsNorm>,
     k_norm: Option<Qwen3RmsNorm>,
     num_heads: usize,
@@ -378,47 +385,38 @@ impl Attention {
         let num_kv_heads = config.num_key_value_heads;
         let bias = config.attention_bias;
 
-        let make_proj = |in_d: usize, out_d: usize, name: &str| -> Result<LinearLayer> {
+        let make_proj = |in_d: usize, out_d: usize, name: &str| -> Result<Linear> {
             if bias {
-                Ok(LinearLayer::Standard(candle_nn::linear(
-                    in_d,
-                    out_d,
-                    vb.pp(name),
-                )?))
+                candle_nn::linear(in_d, out_d, vb.pp(name))
             } else {
-                Ok(LinearLayer::Standard(linear_no_bias(
-                    in_d,
-                    out_d,
-                    vb.pp(name),
-                )?))
+                linear_no_bias(in_d, out_d, vb.pp(name))
             }
         };
 
         let q_proj = make_proj(config.hidden_size, num_heads * head_dim, "q_proj")?;
         let k_proj = make_proj(config.hidden_size, num_kv_heads * head_dim, "k_proj")?;
         let v_proj = make_proj(config.hidden_size, num_kv_heads * head_dim, "v_proj")?;
-        let o_proj = make_proj(num_heads * head_dim, config.hidden_size, "o_proj")?;
+        let o_proj = LinearLayer::Standard(make_proj(
+            num_heads * head_dim,
+            config.hidden_size,
+            "o_proj",
+        )?);
 
         // Create merged QKV projection for Standard weights:
         // Concatenate [q_weight; k_weight; v_weight] along dim 0 so one gemv
         // replaces three.  `narrow` splits are zero-copy views.
         let q_dim = num_heads * head_dim;
         let kv_dim = num_kv_heads * head_dim;
-        let qkv_proj = if let (
-            LinearLayer::Standard(ref q),
-            LinearLayer::Standard(ref k),
-            LinearLayer::Standard(ref v),
-        ) = (&q_proj, &k_proj, &v_proj)
-        {
-            let qkv_w = Tensor::cat(&[q.weight(), k.weight(), v.weight()], 0)?;
-            let qkv_b = match (q.bias(), k.bias(), v.bias()) {
+        let qkv = {
+            let qkv_w = Tensor::cat(&[q_proj.weight(), k_proj.weight(), v_proj.weight()], 0)?;
+            let qkv_b = match (q_proj.bias(), k_proj.bias(), v_proj.bias()) {
                 (Some(qb), Some(kb), Some(vb)) => Some(Tensor::cat(&[qb, kb, vb], 0)?),
                 _ => None,
             };
-            Some(Linear::new(qkv_w, qkv_b))
-        } else {
-            None
+            AttentionQkv::Merged(Linear::new(qkv_w, qkv_b))
         };
+        // q_proj, k_proj and v_proj are dropped here. Keeping them alongside
+        // qkv_w would duplicate roughly 448 MiB for Qwen3-1.7B.
 
         let (q_norm, k_norm) = if config.use_qk_norm {
             (
@@ -438,11 +436,8 @@ impl Attention {
         };
 
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv,
             o_proj,
-            qkv_proj,
             q_norm,
             k_norm,
             num_heads,
@@ -481,11 +476,12 @@ impl Attention {
         };
 
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv: AttentionQkv::Separate {
+                q_proj,
+                k_proj,
+                v_proj,
+            },
             o_proj,
-            qkv_proj: None, // GGUF quantized — cannot merge
             q_norm,
             k_norm,
             num_heads,
@@ -628,17 +624,23 @@ impl Attention {
         let (b_sz, seq_len, _) = hidden_states.dims3()?;
 
         // Use merged QKV if available — one gemv instead of three.
-        let (q, k, v) = if let Some(ref qkv_proj) = self.qkv_proj {
-            let qkv = qkv_proj.forward(hidden_states)?; // [B, S, q_dim+2*kv_dim]
-            let q = qkv.narrow(D::Minus1, 0, self.q_dim)?;
-            let k = qkv.narrow(D::Minus1, self.q_dim, self.kv_dim)?;
-            let v = qkv.narrow(D::Minus1, self.q_dim + self.kv_dim, self.kv_dim)?;
-            (q, k, v)
-        } else {
-            let q = self.q_proj.forward(hidden_states)?;
-            let k = self.k_proj.forward(hidden_states)?;
-            let v = self.v_proj.forward(hidden_states)?;
-            (q, k, v)
+        let (q, k, v) = match &self.qkv {
+            AttentionQkv::Merged(qkv_proj) => {
+                let qkv = qkv_proj.forward(hidden_states)?; // [B, S, q_dim+2*kv_dim]
+                let q = qkv.narrow(D::Minus1, 0, self.q_dim)?;
+                let k = qkv.narrow(D::Minus1, self.q_dim, self.kv_dim)?;
+                let v = qkv.narrow(D::Minus1, self.q_dim + self.kv_dim, self.kv_dim)?;
+                (q, k, v)
+            }
+            AttentionQkv::Separate {
+                q_proj,
+                k_proj,
+                v_proj,
+            } => (
+                q_proj.forward(hidden_states)?,
+                k_proj.forward(hidden_states)?,
+                v_proj.forward(hidden_states)?,
+            ),
         };
 
         // [B, S, num_heads * head_dim] → [B, num_heads, S, head_dim]
