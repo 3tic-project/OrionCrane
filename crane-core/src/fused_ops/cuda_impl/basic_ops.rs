@@ -242,8 +242,11 @@ pub fn fused_add_rmsnorm_bf16(
     let residual = residual.contiguous()?;
     let hidden = hidden.contiguous()?;
     let weight = weight.contiguous()?;
-    let residual_out = Tensor::zeros(residual.shape(), DType::BF16, residual.device())?;
-    let norm_out = Tensor::zeros(residual.shape(), DType::BF16, residual.device())?;
+    // SAFETY: the kernel launches one block per row and writes every element
+    // of both outputs before either tensor is returned. Zero-initializing here
+    // would add two memset launches to every transformer layer and decode step.
+    let residual_out = unsafe { Tensor::empty(residual.shape(), DType::BF16, residual.device())? };
+    let norm_out = unsafe { Tensor::empty(residual.shape(), DType::BF16, residual.device())? };
 
     let (residual_storage, residual_layout) = residual.storage_and_layout();
     let (hidden_storage, hidden_layout) = hidden.storage_and_layout();

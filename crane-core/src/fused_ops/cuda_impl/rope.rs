@@ -40,7 +40,9 @@ pub fn fused_rope_indexed_bf16(
     let cos = cos.contiguous()?;
     let sin = sin.contiguous()?;
     let positions = positions.contiguous()?;
-    let output = Tensor::zeros(x.shape(), DType::BF16, x.device())?;
+    // SAFETY: each logical thread writes both halves of one RoPE pair, so the
+    // launch covers every output element.
+    let output = unsafe { Tensor::empty(x.shape(), DType::BF16, x.device())? };
 
     let (x_storage, x_layout) = x.storage_and_layout();
     let (cos_storage, cos_layout) = cos.storage_and_layout();
@@ -198,8 +200,10 @@ pub fn fused_qk_norm_rope_indexed_bf16(
     let cos = cos.contiguous()?;
     let sin = sin.contiguous()?;
     let positions = positions.contiguous()?;
-    let q_output = Tensor::zeros(q.shape(), DType::BF16, q.device())?;
-    let k_output = Tensor::zeros(k.shape(), DType::BF16, k.device())?;
+    // SAFETY: the grid has one block for every Q/K head and the kernel writes
+    // both halves of every head dimension before these tensors are returned.
+    let q_output = unsafe { Tensor::empty(q.shape(), DType::BF16, q.device())? };
+    let k_output = unsafe { Tensor::empty(k.shape(), DType::BF16, k.device())? };
 
     let (q_storage, q_layout) = q.storage_and_layout();
     let (k_storage, k_layout) = k.storage_and_layout();
