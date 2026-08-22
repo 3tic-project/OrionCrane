@@ -6,6 +6,7 @@ model_path=${MODEL_PATH:-/mnt/Shared_05_disk/home/zjp/ss33/Orion-Qwen3-1.7B_SFT_
 port=${PORT:-9633}
 max_concurrent=${MAX_CONCURRENT:-64}
 gpu_memory_limit=${GPU_MEMORY_LIMIT:-22G}
+decode_tokens_per_seq=${DECODE_TOKENS_PER_SEQ:-}
 result_path=${RESULT_PATH:-"$repo_dir/outputs/oriontranslator-$(date +%Y%m%d-%H%M%S).json"}
 server_log=${SERVER_LOG:-"$repo_dir/outputs/oriontranslator-server-$(date +%Y%m%d-%H%M%S).log"}
 
@@ -24,13 +25,19 @@ if [[ ${SKIP_BUILD:-0} != 1 ]]; then
     --manifest-path "$repo_dir/Cargo.toml"
 fi
 
+server_args=(
+  --model-path "$model_path"
+  --max-concurrent "$max_concurrent"
+  --port "$port"
+  --gpu-memory-limit "$gpu_memory_limit"
+)
+if [[ -n $decode_tokens_per_seq ]]; then
+  server_args+=(--decode-tokens-per-seq "$decode_tokens_per_seq")
+fi
+
 CUDA_VISIBLE_DEVICES=0 RUST_LOG=${RUST_LOG:-info} \
-  "$repo_dir/target/release/crane-oai" \
-    --model-path "$model_path" \
-    --max-concurrent "$max_concurrent" \
-    --port "$port" \
-    --gpu-memory-limit "$gpu_memory_limit" \
-    >"$server_log" 2>&1 &
+  "$repo_dir/target/release/crane-oai" "${server_args[@]}" \
+  >"$server_log" 2>&1 &
 server_pid=$!
 cleanup() {
   if kill -0 "$server_pid" 2>/dev/null; then
