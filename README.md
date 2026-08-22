@@ -110,7 +110,7 @@ Windows 运行时注意：
 
 ```text
 GPU memory at startup: free=19.3G / total=23.5G
-Adaptive defaults: budget=19.3G (source=free VRAM) max_concurrent=64 (auto=64, user=None) decode_tokens_per_seq=32 (auto=32, user=None)
+Adaptive defaults: budget=19.3G (source=free VRAM) max_concurrent=64 (auto=64, user=None) decode_tokens_per_seq=16 (auto=16, user=None)
 ```
 
 ## 常用参数
@@ -140,11 +140,11 @@ CUDA 版本默认启用空闲显存整理：当 engine 完全空闲 `120s` 后�
 | --- | --- | --- | --- |
 | `< 6G` | 6 | 16 | 8G |
 | `6G .. 10G` | 16 | 16 | 12G |
-| `10G .. 16G` | 32 | 32 | 16G |
-| `>= 16G` | 64 | 32 | 24G+ |
+| `10G .. 16G` | 32 | 16 | 16G |
+| `>= 16G` | 64 | 16 | 24G+ |
 | unknown / CPU | 16 | 16 | - |
 
-\* 按 Qwen3-1.7B BF16 模型加载和 warmup 后的典型剩余显存估算；实际分档始终使用启动时检测到的有效预算。24G 档的 64 并发与每序列 32 token 连续解码是 OrionTranslator 短文本翻译负载的实测吞吐最优点，96 并发会使批次碎片化，因此不会自动继续上调。
+\* 按 Qwen3-1.7B BF16 模型加载和 warmup 后的典型剩余显存估算；实际分档始终使用启动时检测到的有效预算。24G 档保留 64 个并发槽位，但每轮只连续解码 16 token，让新请求更快进入 prefill 并减少尾部 ragged cohort；8/16/32 token A/B 中 16 是 OrionTranslator 的稳定最优点。96 并发会使批次碎片化，因此不会自动继续上调。
 
 如果你手动传入 `--max-concurrent` 或 `--decode-tokens-per-seq`，则手动值优先。
 

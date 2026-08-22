@@ -32,6 +32,9 @@ pub struct EngineStats {
     pub prefix_cache_bytes: AtomicU64,
     pub total_batch_decode_calls: AtomicU64,
     pub total_batch_decode_tokens: AtomicU64,
+    pub total_batch_decode_rounds: AtomicU64,
+    pub total_batch_decode_forward_rows: AtomicU64,
+    pub total_batch_decode_inactive_rows: AtomicU64,
     pub total_batch_decode_time_us: AtomicU64,
     pub total_batch_decode_setup_time_us: AtomicU64,
     pub total_batch_decode_setup_kv_len_scan_time_us: AtomicU64,
@@ -189,6 +192,9 @@ impl EngineStats {
             prefix_cache_bytes: AtomicU64::new(0),
             total_batch_decode_calls: AtomicU64::new(0),
             total_batch_decode_tokens: AtomicU64::new(0),
+            total_batch_decode_rounds: AtomicU64::new(0),
+            total_batch_decode_forward_rows: AtomicU64::new(0),
+            total_batch_decode_inactive_rows: AtomicU64::new(0),
             total_batch_decode_time_us: AtomicU64::new(0),
             total_batch_decode_setup_time_us: AtomicU64::new(0),
             total_batch_decode_setup_kv_len_scan_time_us: AtomicU64::new(0),
@@ -336,6 +342,12 @@ impl EngineStats {
         let total_prefill_swap_us = self.total_prefill_swap_time_us.load(Ordering::Relaxed);
         let total_batch_decode_calls = self.total_batch_decode_calls.load(Ordering::Relaxed);
         let total_batch_decode_tokens = self.total_batch_decode_tokens.load(Ordering::Relaxed);
+        let total_batch_decode_rounds = self.total_batch_decode_rounds.load(Ordering::Relaxed);
+        let total_batch_decode_forward_rows =
+            self.total_batch_decode_forward_rows.load(Ordering::Relaxed);
+        let total_batch_decode_inactive_rows = self
+            .total_batch_decode_inactive_rows
+            .load(Ordering::Relaxed);
         let total_batch_decode_us = self.total_batch_decode_time_us.load(Ordering::Relaxed);
         let total_batch_decode_setup_us = self
             .total_batch_decode_setup_time_us
@@ -437,6 +449,14 @@ impl EngineStats {
             avg_prefill_swap_ms: avg_ms(total_prefill_swap_us, total_prefill_steps),
             total_batch_decode_calls,
             total_batch_decode_tokens,
+            total_batch_decode_rounds,
+            total_batch_decode_forward_rows,
+            total_batch_decode_inactive_rows,
+            batch_decode_inactive_row_ratio: if total_batch_decode_forward_rows > 0 {
+                total_batch_decode_inactive_rows as f64 / total_batch_decode_forward_rows as f64
+            } else {
+                0.0
+            },
             total_batch_decode_time_us: total_batch_decode_us,
             total_batch_decode_setup_time_us: total_batch_decode_setup_us,
             total_batch_decode_setup_kv_len_scan_time_us: total_batch_decode_setup_kv_len_scan_us,
@@ -767,6 +787,10 @@ pub struct StatsSnapshot {
     pub avg_prefill_swap_ms: f64,
     pub total_batch_decode_calls: u64,
     pub total_batch_decode_tokens: u64,
+    pub total_batch_decode_rounds: u64,
+    pub total_batch_decode_forward_rows: u64,
+    pub total_batch_decode_inactive_rows: u64,
+    pub batch_decode_inactive_row_ratio: f64,
     pub total_batch_decode_time_us: u64,
     pub total_batch_decode_setup_time_us: u64,
     pub total_batch_decode_setup_kv_len_scan_time_us: u64,
@@ -1010,6 +1034,11 @@ mod tests {
             .store(150_000, Ordering::Relaxed);
         s.total_batch_decode_calls.store(4, Ordering::Relaxed);
         s.total_batch_decode_tokens.store(32, Ordering::Relaxed);
+        s.total_batch_decode_rounds.store(12, Ordering::Relaxed);
+        s.total_batch_decode_forward_rows
+            .store(96, Ordering::Relaxed);
+        s.total_batch_decode_inactive_rows
+            .store(12, Ordering::Relaxed);
         s.total_batch_decode_setup_pad_stack_time_us
             .store(40_000, Ordering::Relaxed);
         s.total_batch_decode_setup_contiguous_time_us
@@ -1244,6 +1273,10 @@ mod tests {
         assert_eq!(snap.total_prefix_cache_hit_tokens, 1792);
         assert_eq!(snap.prefix_cache_entries, 2);
         assert_eq!(snap.prefix_cache_bytes, 4096);
+        assert_eq!(snap.total_batch_decode_rounds, 12);
+        assert_eq!(snap.total_batch_decode_forward_rows, 96);
+        assert_eq!(snap.total_batch_decode_inactive_rows, 12);
+        assert!((snap.batch_decode_inactive_row_ratio - 0.125).abs() < 0.001);
         assert!((snap.avg_queue_wait_ms - 10.0).abs() < 0.01);
         assert!((snap.avg_time_to_first_token_ms - 30.0).abs() < 0.01);
         assert!((snap.avg_batch_decode_setup_pad_stack_ms - 10.0).abs() < 0.01);

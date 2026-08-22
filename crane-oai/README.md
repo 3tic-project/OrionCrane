@@ -45,9 +45,10 @@ Useful options:
 
 | GPU budget | `--max-concurrent` | `--decode-tokens-per-seq` |
 | --- | --- | --- |
-| `< 8G`        | 6  | 16 |
-| `8G .. 18G`   | 16 | 16 |
-| `>= 18G`      | 28 | 32 |
+| `< 6G`        | 6  | 16 |
+| `6G .. 10G`   | 16 | 16 |
+| `10G .. 16G`  | 32 | 16 |
+| `>= 16G`      | 64 | 16 |
 | unknown / CPU | 16 | 16 |
 
 Pass either flag explicitly to override the auto value. Both the GPU memory
@@ -55,7 +56,7 @@ snapshot and the resolved values are logged at startup:
 
 ```
 GPU memory at startup: free=20.0G / total=24.0G
-Adaptive defaults: budget=20.0G (source=free VRAM) max_concurrent=28 ...
+Adaptive defaults: budget=20.0G (source=free VRAM) max_concurrent=64 ...
 ```
 
 ### Performance defaults
@@ -80,8 +81,8 @@ materially affects throughput:
 
 | Setting | Default | Why |
 | --- | --- | --- |
-| `--decode-tokens-per-seq` | **auto: 16 / 16 / 32** | VRAM-tiered (see *Adaptive defaults* above). 16 is best on small/medium GPUs; 32 wins on ≥18G where the larger batch amortises setup cost. |
-| `--max-concurrent` | **auto: 6 / 16 / 28** | VRAM-tiered. Larger budgets fit more concurrent sequences before the KV-cache pressure gate kicks in. |
+| `--decode-tokens-per-seq` | **16** | 8/16/32-token OrionTranslator A/B selects 16: it admits arriving prefills sooner and reduces ragged tail cohorts without the setup churn of 8. |
+| `--max-concurrent` | **auto: 6 / 16 / 32 / 64** | VRAM-tiered. Larger budgets fit more concurrent sequences before the KV-cache pressure gate kicks in. |
 | `--max-seq-len` | **2800** | Covers typical OpenAI-style chat / translation contexts (prompt + completion). Set to 0 for unlimited. |
 | `CRANE_PAGED_KV_NATIVE_APPEND` | **on** (CUDA BF16) | Source of the Round 9 win; collapses per-token KV materialisation kernels. |
 | `CRANE_PAGED_KV_GATHER_EXTRACT` | **on** (CUDA BF16) | One-shot gather kernels per layer instead of per-row per-layer. |

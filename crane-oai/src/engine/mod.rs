@@ -1990,6 +1990,7 @@ impl InferenceEngine {
 
         // Multi-round decode loop with lazy eviction.
         let mut total_tokens_this_step = 0u64;
+        let mut inactive_rows_this_step = 0u64;
         let mut rounds_done = 0usize;
         let mut alive = vec![true; batch.len()];
         let mut pending_finish: Vec<String> = Vec::new();
@@ -2138,6 +2139,7 @@ impl InferenceEngine {
                 }
             };
             let active_rows = alive.iter().filter(|&&is_alive| is_alive).count() as u64;
+            inactive_rows_this_step += batch_size as u64 - active_rows;
             let graph_decision = self.cuda_graph_decode.classify_round(
                 batch_size,
                 self.model.device(),
@@ -2909,6 +2911,15 @@ impl InferenceEngine {
         self.stats
             .total_batch_decode_tokens
             .fetch_add(total_tokens_this_step, Ordering::Relaxed);
+        self.stats
+            .total_batch_decode_rounds
+            .fetch_add(rounds_done as u64, Ordering::Relaxed);
+        self.stats
+            .total_batch_decode_forward_rows
+            .fetch_add(batch_size as u64 * rounds_done as u64, Ordering::Relaxed);
+        self.stats
+            .total_batch_decode_inactive_rows
+            .fetch_add(inactive_rows_this_step, Ordering::Relaxed);
         self.stats
             .total_batch_decode_time_us
             .fetch_add(decode_us, Ordering::Relaxed);
