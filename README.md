@@ -205,3 +205,13 @@ CUDA 版本默认启用空闲显存整理：当 engine 完全空闲 `120s` 后�
 - [SGLang](https://github.com/sgl-project/sglang)：本项目既兼容其原生接口，也参考了其请求结构、调度策略和部分显存/KV 管理思路。
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer)：paged attention 元数据组织、paged decode/prefill 接口形态与后续优化路线。
 - [FlashAttention](https://github.com/Dao-AILab/flash-attention)：attention kernel、online softmax 以及高性能注意力实现方向。
+
+## OrionTranslator 性能基准
+
+`benchmarks/run_oriontranslator_bench.sh` 会先确认 GPU0 没有计算进程，再启动仅可见 GPU0 的服务，并使用与 OrionTranslator `alnilam` 一致的 prompt 结构和采样参数运行固定日译中语料。默认测试 64 个请求、32 并发、每个请求 15 行，并输出吞吐、延迟和 JSONL 格式通过率：
+
+```bash
+benchmarks/run_oriontranslator_bench.sh
+```
+
+可通过 `MAX_CONCURRENT`、`CONCURRENCY`、`REQUESTS`、`PROMPT_MODE` 等环境变量做单变量 A/B；额外的客户端参数可直接追加在命令末尾。结果与服务日志写入本地 `outputs/`，不会进入 Git。
