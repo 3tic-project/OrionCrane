@@ -413,7 +413,8 @@ pub struct InferenceEngine {
     cuda_graph_decode_poisoned: std::collections::HashSet<cuda_graph::CudaGraphDecodeKey>,
     /// Wait-batching: max time (µs) to wait for additional in-flight requests
     /// after `drain_requests`, when the current batch is below the configured
-    /// target. 0 disables the feature (default).
+    /// target. The 1 ms default coalesces HTTP arrivals into tensor-core-sized
+    /// cohorts; 0 disables the feature.
     sched_wait_batch_us: u64,
     /// Wait-batching: target value of `running.len() + waiting.len()`.
     /// The spin loop exits early once this target is met.
@@ -605,7 +606,7 @@ impl InferenceEngine {
             cuda_graph_decode_entries: HashMap::new(),
             #[cfg(feature = "cuda")]
             cuda_graph_decode_poisoned: std::collections::HashSet::new(),
-            sched_wait_batch_us: env_usize("CRANE_SCHED_WAIT_BATCH_US", 0) as u64,
+            sched_wait_batch_us: env_usize("CRANE_SCHED_WAIT_BATCH_US", 1000) as u64,
             sched_wait_batch_target: env_usize("CRANE_SCHED_WAIT_BATCH_TARGET", effective_max),
             sched_wait_batch_poll_us: env_usize("CRANE_SCHED_WAIT_BATCH_POLL_US", 50) as u64,
         };
