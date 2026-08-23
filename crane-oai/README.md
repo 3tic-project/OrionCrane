@@ -47,7 +47,7 @@ Useful options:
 | --- | --- | --- |
 | `< 6G`        | 6  | 16 |
 | `6G .. 10G`   | 16 | 16 |
-| `10G .. 16G`  | 32 | 16 |
+| `10G .. 16G`  | 32 | 32 |
 | `>= 16G`      | 64 | 16 |
 | unknown / CPU | 16 | 16 |
 
@@ -81,15 +81,16 @@ materially affects throughput:
 
 | Setting | Default | Why |
 | --- | --- | --- |
-| `--decode-tokens-per-seq` | **16** | 8/16/32-token OrionTranslator A/B selects 16: it admits arriving prefills sooner and reduces ragged tail cohorts without the setup churn of 8. |
+| `--decode-tokens-per-seq` | **auto: 16 / 32 / 16** | The 10–16G post-load tier uses 32: Qwen3-4B OrionTranslator A/B selects it over 8/16/64. Small-memory and 64-way tiers retain 16 to limit stalls and ragged tails. |
 | `--max-concurrent` | **auto: 6 / 16 / 32 / 64** | VRAM-tiered. Larger budgets fit more concurrent sequences before the KV-cache pressure gate kicks in. |
 | `--max-seq-len` | **2800** | Covers typical OpenAI-style chat / translation contexts (prompt + completion). Set to 0 for unlimited. |
-| `CRANE_PAGED_KV_NATIVE_APPEND` | **on** (CUDA BF16) | Source of the Round 9 win; collapses per-token KV materialisation kernels. |
-| `CRANE_PAGED_KV_GATHER_EXTRACT` | **on** (CUDA BF16) | One-shot gather kernels per layer instead of per-row per-layer. |
+| `CRANE_PAGED_KV_NATIVE_APPEND` | **adaptive** (CUDA BF16) | Enabled only when a 1024-token shadow working set is at most 25% of post-load VRAM. This retains the small-model gather win without duplicating multi-GiB KV on large models. |
+| `CRANE_PAGED_KV_GATHER_EXTRACT` | **follows native append** | One-shot gather kernels per layer when the shadow cache fits; contiguous fallback otherwise. |
 | `CRANE_PAGED_KV_ATTENTION` | **off** | Current paged attention kernel regresses on short/medium contexts; eager GQA wins. |
 | `CRANE_PAGED_KV_BATCHED_SETUP` | **on** | Use the validated page-gathered batched KV setup path by default; set `0` to return to per-row materialization for A/B checks. |
 | `CRANE_BATCH_KV_RAGGED_COPY` | **on** (CUDA BF16) | Uses one fused BF16 kernel per layer for ragged batched-setup workspace copies. |
 | `CRANE_PREFIX_CACHE` | **on** | Admission-controlled prefix KV reuse; allocates only after a live prompt shares at least 256 tokens. |
+| `CRANE_SCHED_WAIT_BATCH_US` | **1000** | Briefly coalesces concurrent HTTP arrivals into larger GEMM cohorts. Set `0` for the lowest possible single-request latency. |
 | `CRANE_CUDA_GRAPH_DECODE` | **off** | Eager forward is at parity or ~1% faster on the validated workload. |
 | `CRANE_CUDA_GRAPH_DECODE_CAPTURE` | **off** | Requires the master switch; opt-in only. |
 | `CRANE_CUDA_GRAPH_DECODE_WIDTH_BUCKET` | **on** | Safe with capture off; ~6–10% lift when capture is on. Leave on. |
@@ -138,14 +139,14 @@ curl http://localhost:8000/v1/chat/completions \
 
 - The active API surface is text generation, tokenization, model metadata, and server health.
 - Qwen3 chat templates are loaded from `tokenizer_config.json` when available, with a Qwen3 fallback template.
-- On CUDA BF16, paged-KV native append and GPU gather extraction are enabled by default. Decode-only paged attention is available but **off by default** because the current kernel regresses end-to-end throughput on Qwen3 short/medium translation contexts compared to the contiguous GQA path. Set `CRANE_PAGED_KV_ATTENTION=1` to opt in (and optionally tune `CRANE_PAGED_KV_ATTENTION_MIN_SEQ_LEN` for profiling); set `CRANE_PAGED_KV_NATIVE_APPEND=0` to return to the contiguous KV fallback.
+- On CUDA BF16, paged-KV native append and GPU gather extraction are enabled only when the projected shadow cache fits within 25% of the post-load GPU budget. Decode-only paged attention is available but **off by default** because the current kernel regresses end-to-end throughput on Qwen3 short/medium translation contexts compared to the contiguous GQA path. Set `CRANE_PAGED_KV_ATTENTION=1` and `CRANE_PAGED_KV_NATIVE_APPEND=1` to opt in; set `CRANE_PAGED_KV_NATIVE_APPEND=0` to force the contiguous KV fallback.
 
 ## Qwen3 Runtime Flags
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `CRANE_PAGED_KV_NATIVE_APPEND` | on for CUDA BF16 | Copy/import past and generated K/V into GPU pages. |
-| `CRANE_PAGED_KV_GATHER_EXTRACT` | on for CUDA BF16 | Gather page-backed K/V into per-sequence state after a batch step. |
+| `CRANE_PAGED_KV_NATIVE_APPEND` | adaptive for CUDA BF16 | Copy/import past and generated K/V into GPU pages only when the projected shadow working set fits the VRAM budget. Explicit `0`/`1` overrides the heuristic. |
+| `CRANE_PAGED_KV_GATHER_EXTRACT` | follows native append | Gather page-backed K/V into per-sequence state after a batch step. |
 | `CRANE_PAGED_KV_ATTENTION` | **off** (opt-in) | Allow GPU page-backed BF16 decode attention when rows are resident and the heuristic passes. Currently regresses throughput on Qwen3 short/medium contexts; enable explicitly only when profiling the paged attention kernel. |
 | `CRANE_PAGED_KV_ATTENTION_MIN_SEQ_LEN` | `1024` | Minimum max past length in the batch before the current paged attention kernel is used. |
 | `CRANE_PAGED_KV_ATTENTION_MIN_ACTIVE_ROWS` | `1` | Minimum live rows before paged attention is considered. |
@@ -158,6 +159,8 @@ curl http://localhost:8000/v1/chat/completions \
 | `CRANE_PREFIX_CACHE` | on | Cache immutable prompt-prefix KV only after another live request proves the prefix is reusable. |
 | `CRANE_PREFIX_CACHE_MIN_TOKENS` | `256` | Minimum shared prefix. The conservative default avoids losing time on short chat-template/glossary prefixes. |
 | `CRANE_PREFIX_CACHE_MAX_ENTRIES` | `4` | LRU entry cap. |
+| `CRANE_SCHED_WAIT_BATCH_US` | `1000` | Maximum request-arrival coalescing window in microseconds; `0` disables it. |
+| `CRANE_SCHED_WAIT_BATCH_TARGET` | effective max concurrency | Stop waiting early once this many running + waiting requests are present. |
 | `CRANE_PREFIX_CACHE_MAX_MB` | `256` | Requested persistent prefix-KV budget. The effective cap is the smaller of this value and one quarter of the request-KV budget on memory-limited deployments. |
 | `CRANE_IDLE_CUDA_MEM_TRIM_SECS` | `120` | When no requests are active, wait this many seconds, clear request-local workspaces, synchronize CUDA, and trim the CUDA async memory pool. This returns idle pool reservations but keeps model weights/context resident; `0` disables it. |
 

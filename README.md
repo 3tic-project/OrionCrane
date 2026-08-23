@@ -140,7 +140,7 @@ CUDA 版本默认启用空闲显存整理：当 engine 完全空闲 `120s` 后�
 | --- | --- | --- | --- |
 | `< 6G` | 6 | 16 | 8G |
 | `6G .. 10G` | 16 | 16 | 12G |
-| `10G .. 16G` | 32 | 16 | 16G |
+| `10G .. 16G` | 32 | 32 | 16G / Qwen3-4B on 24G |
 | `>= 16G` | 64 | 16 | 24G+ |
 | unknown / CPU | 16 | 16 | - |
 
@@ -184,10 +184,11 @@ CUDA 版本默认启用空闲显存整理：当 engine 完全空闲 `120s` 后�
 
 其中包括：
 
-- `CRANE_PAGED_KV_NATIVE_APPEND`，默认开启（CUDA BF16）
-- `CRANE_PAGED_KV_GATHER_EXTRACT`，默认开启（CUDA BF16）
+- `CRANE_PAGED_KV_NATIVE_APPEND`，CUDA BF16 下按模型 KV、并发和加载后显存预算自适应；显式 `0`/`1` 可覆盖
+- `CRANE_PAGED_KV_GATHER_EXTRACT`，跟随 native append 开关
 - `CRANE_PAGED_KV_BATCHED_SETUP`，默认开启，使用已验证的 page-gathered batched KV setup
 - `CRANE_PREFIX_CACHE`，默认开启；只有排队请求实际共享至少 256 token 前缀时才分配缓存
+- `CRANE_SCHED_WAIT_BATCH_US`，默认 `1000` 微秒，将并发 HTTP 到达合并成更大的 GEMM cohort；设为 `0` 可优先最低单请求延迟
 - `CRANE_PAGED_KV_ATTENTION`，默认关闭，仅建议分析性能时手动开启
 - `CRANE_CUDA_GRAPH_DECODE` 系列开关，默认关闭
 - `CRANE_DISABLE_GPU_MEM_HARD_CHECK`，默认开启以避免共享 GPU 上 `cuMemGetInfo` 误触发抢占；需要严格执行 `--gpu-memory-limit` 时设为 `0`
