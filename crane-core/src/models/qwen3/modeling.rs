@@ -189,6 +189,8 @@ impl<R: Read + Seek> Gguf<R> {
 pub enum LinearLayer {
     Standard(Linear),
     Quantized(candle_core::quantized::QMatMul),
+    #[cfg(feature = "cuda")]
+    W8A16(W8A16Linear),
 }
 
 impl Module for LinearLayer {
@@ -209,8 +211,101 @@ impl Module for LinearLayer {
                     Ok(out)
                 }
             }
+            #[cfg(feature = "cuda")]
+            Self::W8A16(l) => l.forward(xs),
         }
     }
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug)]
+pub struct W8A16Linear {
+    weight: Tensor,
+    scales: Tensor,
+    bias: Option<Tensor>,
+    cublas_threshold: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl W8A16Linear {
+    fn from_linear(linear: Linear) -> Result<Self> {
+        let weight = linear.weight();
+        if weight.dtype() != DType::BF16 || !weight.device().is_cuda() {
+            candle_core::bail!("Qwen3 W8A16 requires CUDA BF16 weights")
+        }
+        let (n, k) = weight.dims2()?;
+        if k % 16 != 0 {
+            candle_core::bail!("Qwen3 W8A16 requires K multiple of 16, got {k}")
+        }
+
+        // Quantize one completed projection at a time so peak host memory is
+        // bounded by the largest Qwen3 matrix rather than the full checkpoint.
+        let values = weight
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<half::bf16>()?;
+        let mut packed = Vec::with_capacity(values.len());
+        let mut scales = Vec::with_capacity(n);
+        for row in values.chunks_exact(k) {
+            let max_abs = row
+                .iter()
+                .map(|value| value.to_f32().abs())
+                .fold(0.0f32, f32::max);
+            let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+            let inverse_scale = scale.recip();
+            scales.push(scale);
+            packed.extend(row.iter().map(|value| {
+                let q = (value.to_f32() * inverse_scale)
+                    .round()
+                    .clamp(-127.0, 127.0) as i32;
+                (q + 128) as u8
+            }));
+        }
+
+        let device = weight.device();
+        let weight = Tensor::from_vec(packed, (n, k), device)?;
+        let scales = Tensor::from_vec(scales, n, device)?;
+        let bias = linear.bias().cloned();
+        let cublas_threshold = std::env::var("CRANE_W8A16_CUBLAS_M_THRESHOLD")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(32);
+        Ok(Self {
+            weight,
+            scales,
+            bias,
+            cublas_threshold,
+        })
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Module for W8A16Linear {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let k = *xs
+            .dims()
+            .last()
+            .ok_or_else(|| candle_core::Error::Msg("W8A16 linear expects rank >= 1".into()))?;
+        let m = xs.elem_count() / k;
+        let output = if m > self.cublas_threshold {
+            let weight = crate::fused_ops::w8a16_dequantize(&self.weight, &self.scales)?;
+            Linear::new(weight, None).forward(xs)?
+        } else {
+            crate::fused_ops::w8a16_linear(xs, &self.weight, &self.scales)?
+        };
+        match &self.bias {
+            Some(bias) => output.broadcast_add(bias),
+            None => Ok(output),
+        }
+    }
+}
+
+fn maybe_w8a16_linear(linear: Linear) -> Result<LinearLayer> {
+    #[cfg(feature = "cuda")]
+    if env_flag_default("CRANE_QWEN3_W8A16", false) {
+        return Ok(LinearLayer::W8A16(W8A16Linear::from_linear(linear)?));
+    }
+    Ok(LinearLayer::Standard(linear))
 }
 
 // ── Event-tracking RAII guard ────────────────────────────────────────────
@@ -354,7 +449,7 @@ struct PagedAttentionDecodeRun<'a> {
 /// tensors are released after construction; quantized GGUF projections remain
 /// separate because their packed formats cannot be concatenated directly.
 enum AttentionQkv {
-    Merged(Linear),
+    Merged(LinearLayer),
     Separate {
         q_proj: LinearLayer,
         k_proj: LinearLayer,
@@ -396,11 +491,11 @@ impl Attention {
         let q_proj = make_proj(config.hidden_size, num_heads * head_dim, "q_proj")?;
         let k_proj = make_proj(config.hidden_size, num_kv_heads * head_dim, "k_proj")?;
         let v_proj = make_proj(config.hidden_size, num_kv_heads * head_dim, "v_proj")?;
-        let o_proj = LinearLayer::Standard(make_proj(
+        let o_proj = maybe_w8a16_linear(make_proj(
             num_heads * head_dim,
             config.hidden_size,
             "o_proj",
-        )?);
+        )?)?;
 
         // Create merged QKV projection for Standard weights:
         // Concatenate [q_weight; k_weight; v_weight] along dim 0 so one gemv
@@ -413,7 +508,7 @@ impl Attention {
                 (Some(qb), Some(kb), Some(vb)) => Some(Tensor::cat(&[qb, kb, vb], 0)?),
                 _ => None,
             };
-            AttentionQkv::Merged(Linear::new(qkv_w, qkv_b))
+            AttentionQkv::Merged(maybe_w8a16_linear(Linear::new(qkv_w, qkv_b))?)
         };
         // q_proj, k_proj and v_proj are dropped here. Keeping them alongside
         // qkv_w would duplicate roughly 448 MiB for Qwen3-1.7B.
@@ -894,7 +989,7 @@ impl Attention {
 enum MlpGateUp {
     /// Merged gate+up weight — one gemv instead of two. Standard (BF16/F16/F32) only.
     Merged {
-        gate_up_proj: Linear,
+        gate_up_proj: LinearLayer,
         intermediate_size: usize,
     },
     /// Separate quantized gate and up projections (GGUF).
@@ -921,17 +1016,17 @@ impl Mlp {
             config.intermediate_size,
             vb.pp("up_proj"),
         )?;
-        let down_proj = LinearLayer::Standard(linear_no_bias(
+        let down_proj = maybe_w8a16_linear(linear_no_bias(
             config.intermediate_size,
             config.hidden_size,
             vb.pp("down_proj"),
-        )?);
+        )?)?;
 
         // Merge gate+up into a single weight, then drop the originals to save VRAM.
         let gate_up_w = Tensor::cat(&[gate_proj.weight(), up_proj.weight()], 0)?;
         // gate_proj and up_proj are dropped here — their VRAM is freed.
         let gate_up = MlpGateUp::Merged {
-            gate_up_proj: Linear::new(gate_up_w, None),
+            gate_up_proj: maybe_w8a16_linear(Linear::new(gate_up_w, None))?,
             intermediate_size: config.intermediate_size,
         };
 
@@ -1234,6 +1329,15 @@ impl Qwen3Model {
     /// Construct from safetensors / HuggingFace checkpoint.
     pub fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
         let dtype = vb.dtype();
+        let w8a16_enabled = cfg!(feature = "cuda")
+            && env_flag_default("CRANE_QWEN3_W8A16", false)
+            && vb.device().is_cuda();
+        let w8a16_start = Instant::now();
+        if w8a16_enabled {
+            eprintln!(
+                "Qwen3 W8A16 enabled: per-output-channel symmetric INT8 weights, BF16 activations"
+            );
+        }
         let model_vb = vb.pp("model");
         let embed_tokens = candle_nn::embedding(
             config.vocab_size,
@@ -1245,6 +1349,24 @@ impl Qwen3Model {
         let layers_vb = model_vb.pp("layers");
         for i in 0..config.num_hidden_layers {
             layers.push(DecoderLayer::new(config, layers_vb.pp(i))?);
+        }
+        if w8a16_enabled {
+            let q_dim = config.num_attention_heads * config.head_dim();
+            let kv_dim = config.num_key_value_heads * config.head_dim();
+            let elements_per_layer = (q_dim + 2 * kv_dim) * config.hidden_size
+                + config.hidden_size * q_dim
+                + 3 * config.intermediate_size * config.hidden_size;
+            let scales_per_layer =
+                q_dim + 2 * kv_dim + 2 * config.hidden_size + 2 * config.intermediate_size;
+            let elements = elements_per_layer * config.num_hidden_layers;
+            let packed_bytes = elements + scales_per_layer * config.num_hidden_layers * 4;
+            eprintln!(
+                "Qwen3 W8A16 packed {} projection layers in {:.2}s: {:.2} GiB -> {:.2} GiB persistent weights",
+                config.num_hidden_layers * 4,
+                w8a16_start.elapsed().as_secs_f64(),
+                elements as f64 * 2.0 / (1u64 << 30) as f64,
+                packed_bytes as f64 / (1u64 << 30) as f64,
+            );
         }
 
         let norm =
