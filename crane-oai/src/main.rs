@@ -58,8 +58,8 @@ struct Args {
     #[arg(long)]
     max_concurrent: Option<usize>,
 
-    /// Tokens to decode per sequence before switching. Defaults to 16, which
-    /// keeps translation cohorts compact without excessive KV setup churn.
+    /// Tokens to decode per sequence before switching. If unset, uses 32 for
+    /// 10-16G post-load budgets and 16 for smaller or larger concurrency tiers.
     #[arg(long)]
     decode_tokens_per_seq: Option<usize>,
 
@@ -174,7 +174,7 @@ fn query_gpu_free_total(_device: &crane_core::models::Device) -> (u64, u64) {
 /// | ---------------- | -------------- | --------------------- |
 /// | < 6G             |  6             | 16                    |
 /// | 6G  ..< 10G      | 16             | 16                    |
-/// | 10G ..< 16G      | 32             | 16                    |
+/// | 10G ..< 16G      | 32             | 32                    |
 /// | >= 16G           | 64             | 16                    |
 /// | unknown / CPU    | 16             | 16  (middle tier)     |
 fn adaptive_runtime_defaults(budget_bytes: u64) -> (usize, usize) {
@@ -187,7 +187,7 @@ fn adaptive_runtime_defaults(budget_bytes: u64) -> (usize, usize) {
     } else if budget_bytes < 10 * G {
         (16, 16)
     } else if budget_bytes < 16 * G {
-        (32, 16)
+        (32, 32)
     } else {
         (64, 16)
     }
@@ -492,8 +492,8 @@ mod tests {
         assert_eq!(adaptive_runtime_defaults(6 * G - 1), (6, 16));
         assert_eq!(adaptive_runtime_defaults(6 * G), (16, 16));
         assert_eq!(adaptive_runtime_defaults(10 * G - 1), (16, 16));
-        assert_eq!(adaptive_runtime_defaults(10 * G), (32, 16));
-        assert_eq!(adaptive_runtime_defaults(16 * G - 1), (32, 16));
+        assert_eq!(adaptive_runtime_defaults(10 * G), (32, 32));
+        assert_eq!(adaptive_runtime_defaults(16 * G - 1), (32, 32));
         assert_eq!(adaptive_runtime_defaults(16 * G), (64, 16));
         assert_eq!(adaptive_runtime_defaults(80 * G), (64, 16));
     }
