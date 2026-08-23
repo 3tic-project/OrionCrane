@@ -285,6 +285,40 @@ fn is_cuda_device(_device: &Device) -> bool {
 /// engine a realistic estimate of how much KV it can afford before the GPU
 /// runs out of memory.
 const KV_GPU_OVERHEAD_FACTOR: u64 = 6;
+/// Native paged-KV is a second GPU copy while contiguous attention remains
+/// authoritative.  Budget it against a representative translation working
+/// set so large models do not pay for a shadow cache that will be discarded
+/// as soon as memory pressure starts.
+const PAGED_KV_DEFAULT_WORKING_SET_TOKENS: usize = 1024;
+const PAGED_KV_DEFAULT_MAX_DYNAMIC_BUDGET_FRACTION: u64 = 4;
+
+fn paged_kv_native_append_fits_budget(
+    layout: paged_kv::PagedKvLayout,
+    max_concurrent: usize,
+    max_seq_len: usize,
+    baseline_gpu_bytes: u64,
+    gpu_capacity_bytes: u64,
+) -> bool {
+    // An unknown capacity preserves the prior CUDA-BF16 default. Explicit
+    // CRANE_PAGED_KV_NATIVE_APPEND always overrides this heuristic.
+    if gpu_capacity_bytes == 0 {
+        return true;
+    }
+    let dynamic_budget = gpu_capacity_bytes.saturating_sub(baseline_gpu_bytes);
+    if dynamic_budget == 0 {
+        return false;
+    }
+    let working_set_tokens = if max_seq_len == 0 {
+        PAGED_KV_DEFAULT_WORKING_SET_TOKENS
+    } else {
+        max_seq_len.min(PAGED_KV_DEFAULT_WORKING_SET_TOKENS)
+    };
+    let projected_shadow_bytes = layout
+        .bytes_per_block(1)
+        .saturating_mul(max_concurrent as u64)
+        .saturating_mul(working_set_tokens as u64);
+    projected_shadow_bytes <= dynamic_budget / PAGED_KV_DEFAULT_MAX_DYNAMIC_BUDGET_FRACTION
+}
 
 /// Continuous-batching inference engine.
 ///
@@ -413,8 +447,7 @@ impl InferenceEngine {
         }
 
         let stats = Arc::new(EngineStats::new());
-        let paged_kv_default_enabled =
-            is_cuda_device(model.device()) && model.dtype() == DType::BF16;
+        let paged_kv_cuda_bf16 = is_cuda_device(model.device()) && model.dtype() == DType::BF16;
         let paged_kv_block_size = env_usize("CRANE_PAGED_KV_BLOCK_SIZE", DEFAULT_BLOCK_SIZE);
         let paged_kv_layout = model.kv_cache_layout().unwrap_or_else(|| {
             warn!("Model did not expose KV layout; paged KV byte counters will be zero");
@@ -425,6 +458,24 @@ impl InferenceEngine {
                 dtype_size_bytes: 0,
             }
         });
+        let (_gpu_used, gpu_total) = query_gpu_memory_usage(model.device());
+        let paged_kv_capacity = if memory_config.gpu_memory_limit_bytes > 0 {
+            if gpu_total > 0 {
+                memory_config.gpu_memory_limit_bytes.min(gpu_total)
+            } else {
+                memory_config.gpu_memory_limit_bytes
+            }
+        } else {
+            gpu_total
+        };
+        let paged_kv_default_enabled = paged_kv_cuda_bf16
+            && paged_kv_native_append_fits_budget(
+                paged_kv_layout,
+                effective_max,
+                memory_config.max_seq_len,
+                memory_config.baseline_gpu_bytes,
+                paged_kv_capacity,
+            );
         let paged_kv_allocator = PagedKvAllocator::new(paged_kv_block_size, paged_kv_layout);
         let requested_prefix_cache_bytes =
             (env_usize("CRANE_PREFIX_CACHE_MAX_MB", 256) as u64) << 20;
@@ -452,6 +503,28 @@ impl InferenceEngine {
             .max(1);
         let paged_kv_native_append =
             env_flag_default("CRANE_PAGED_KV_NATIVE_APPEND", paged_kv_default_enabled);
+        if paged_kv_cuda_bf16 && !env_flag_is_explicit("CRANE_PAGED_KV_NATIVE_APPEND") {
+            let working_set_tokens = if memory_config.max_seq_len == 0 {
+                PAGED_KV_DEFAULT_WORKING_SET_TOKENS
+            } else {
+                memory_config
+                    .max_seq_len
+                    .min(PAGED_KV_DEFAULT_WORKING_SET_TOKENS)
+            };
+            let projected_shadow_bytes = paged_kv_layout
+                .bytes_per_block(1)
+                .saturating_mul(effective_max as u64)
+                .saturating_mul(working_set_tokens as u64);
+            info!(
+                enabled = paged_kv_native_append,
+                projected_shadow = %format_bytes_engine(projected_shadow_bytes),
+                gpu_capacity = %format_bytes_engine(paged_kv_capacity),
+                baseline = %format_bytes_engine(memory_config.baseline_gpu_bytes),
+                max_concurrent = effective_max,
+                working_set_tokens,
+                "adaptive paged-KV shadow-cache default"
+            );
+        }
         let paged_kv_pressure_reserve_bytes =
             (env_usize("CRANE_PAGED_KV_PRESSURE_RESERVE_MB", 512) as u64) << 20;
         let paged_kv_gather_extract = paged_kv_native_append
@@ -3281,4 +3354,60 @@ fn format_optional_bytes_engine(bytes: Option<u64>) -> String {
     bytes
         .map(format_bytes_engine)
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{paged_kv::PagedKvLayout, paged_kv_native_append_fits_budget};
+
+    fn qwen_layout(num_layers: usize) -> PagedKvLayout {
+        PagedKvLayout {
+            num_layers,
+            num_kv_heads: 8,
+            head_dim: 128,
+            dtype_size_bytes: 2,
+        }
+    }
+
+    #[test]
+    fn paged_kv_shadow_default_accounts_for_model_and_concurrency() {
+        const G: u64 = 1 << 30;
+        // Qwen3-4B on a 22 GiB budget: 32 x 1024 shadow tokens would use
+        // 4.5 GiB, over one quarter of the 13.6 GiB dynamic budget.
+        assert!(!paged_kv_native_append_fits_budget(
+            qwen_layout(36),
+            32,
+            2800,
+            8 * G + 410 * (1 << 20),
+            22 * G,
+        ));
+        // The smaller 28-layer model at 32-way concurrency keeps the copy
+        // below the same fraction and retains the gather fast path.
+        assert!(paged_kv_native_append_fits_budget(
+            qwen_layout(28),
+            32,
+            2800,
+            4 * G,
+            22 * G,
+        ));
+        // Higher concurrency is intentionally more conservative.
+        assert!(!paged_kv_native_append_fits_budget(
+            qwen_layout(28),
+            64,
+            2800,
+            4 * G,
+            22 * G,
+        ));
+    }
+
+    #[test]
+    fn paged_kv_shadow_default_preserves_unknown_capacity_fallback() {
+        assert!(paged_kv_native_append_fits_budget(
+            qwen_layout(36),
+            32,
+            0,
+            0,
+            0,
+        ));
+    }
 }
