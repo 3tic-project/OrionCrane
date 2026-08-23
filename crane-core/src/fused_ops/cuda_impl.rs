@@ -27,6 +27,7 @@ mod memory;
 mod paged_kv;
 mod rope;
 mod sampling;
+mod w8a16;
 
 pub use basic_ops::*;
 pub use graph::*;
@@ -34,3 +35,4 @@ pub use memory::*;
 pub use paged_kv::*;
 pub use rope::*;
 pub use sampling::*;
+pub use w8a16::*;

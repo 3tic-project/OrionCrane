@@ -6,6 +6,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/fused_ops/paged_kv.cuh");
     println!("cargo:rerun-if-changed=kernels/fused_ops/topk.cuh");
     println!("cargo:rerun-if-changed=kernels/fused_ops/rope.cuh");
+    println!("cargo:rerun-if-changed=kernels/fused_ops/w8a16.cuh");
     println!("cargo:rerun-if-changed=build.rs");
 
     // Only compile CUDA kernels when the cuda feature is enabled.

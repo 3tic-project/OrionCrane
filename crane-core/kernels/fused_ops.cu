@@ -11,6 +11,8 @@
  * scans the vocabulary in three radix/gather passes with a tunable block width,
  * keeps its u32 output device-resident for the next decode round, and retains
  * the previous insertion-list kernel for opt-in A/B validation.
+ * W8A16 experiments provide numerically aligned direct, split-K, and prefill
+ * dequant entries.
  */
 
 #include "fused_ops/common.cuh"
@@ -19,3 +21,4 @@
 #include "fused_ops/sampling.cuh"
 #include "fused_ops/paged_kv.cuh"
 #include "fused_ops/rope.cuh"
+#include "fused_ops/w8a16.cuh"
